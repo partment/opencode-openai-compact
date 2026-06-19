@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/partment/opencode-openai-compact/main/configSchema.json",
+  "title": "opencode-openai-compact configuration",
+  "description": "Configuration schema for the opencode-openai-compact OpenCode plugin.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON schema URL for editor integration."
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enables or disables OpenAI Responses API compaction checkpoint injection."
+    },
+    "providers": {
+      "type": "object",
+      "minProperties": 1,
+      "default": {
+        "openai": {
+          "compactModel": "gpt-5.4"
+        }
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["compactModel"],
+        "properties": {
+          "compactModel": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Model sent to the OpenAI Responses compact endpoint for this provider."
+          }
+        }
+      },
+      "description": "OpenCode provider ids to wrap, keyed by provider id."
+    },
+    "headers": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "compact": {
+          "type": "string",
+          "minLength": 1,
+          "default": "x-opencode-openai-responses-compact",
+          "description": "Internal request header used to mark compaction calls."
+        },
+        "session": {
+          "type": "string",
+          "minLength": 1,
+          "default": "x-opencode-openai-responses-compact-session",
+          "description": "Internal request header used to pass the OpenCode session id into fetch."
+        }
+      }
+    },
+    "responses": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "endpointPath": {
+          "type": "string",
+          "minLength": 1,
+          "default": "/responses",
+          "description": "Responses API endpoint path suffix to intercept."
+        },
+        "compactEndpointPath": {
+          "type": "string",
+          "minLength": 1,
+          "default": "/responses/compact",
+          "description": "Responses API compact endpoint path used for compaction calls."
+        }
+      }
+    },
+    "compactBodyKeys": {
+      "type": "array",
+      "default": [
+        "input",
+        "instructions",
+        "previous_response_id",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "service_tier"
+      ],
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Request body keys copied from the original responses request into the compact request."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "default": "Context compacted.\nFollowing conversations will continue from this compacted checkpoint.",
+      "description": "Synthetic assistant text shown after a successful compact call."
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "retentionDays": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Number of days to keep compaction checkpoints."
+        },
+        "deleteOnSessionDeleted": {
+          "type": "boolean",
+          "default": true,
+          "description": "Deletes checkpoints for a session when OpenCode emits session.deleted."
+        }
+      }
+    }
+  }
+}

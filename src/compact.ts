@@ -1,0 +1,500 @@
+import type { Hooks } from "@opencode-ai/plugin"
+import { defaultConfig, type OpenAICompactConfig } from "./schema.js"
+import { CheckpointStore, type AnyRecord, type Checkpoint } from "./state.js"
+
+type FetchLike = typeof fetch
+type MessageEntry = {
+  info?: { id?: string; sessionID?: string; time?: { created?: number } }
+  parts?: Array<{ type?: string; text?: string; messageID?: string; time?: { start?: number } }>
+}
+type MessageBoundary = { messageID: string; createdAt: number }
+type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
+type ProviderConfig = OpenAICompactConfig["providers"][string]
+
+const wrappedFetch = "__opencodeOpenAICompactFetch"
+
+function asRecord(value: unknown): AnyRecord | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
+function urlOf(input: RequestInfo | URL): URL | undefined {
+  try {
+    if (input instanceof URL) return new URL(input.href)
+    if (input instanceof Request) return new URL(input.url)
+    return new URL(String(input))
+  } catch {
+    return undefined
+  }
+}
+
+function pathWithoutTrailingSlash(value: string) {
+  return value.length > 1 ? value.replace(/\/+$/, "") : value
+}
+
+export function isResponsesUrl(url: URL, config: OpenAICompactConfig) {
+  return pathWithoutTrailingSlash(url.pathname).endsWith(config.responses.endpointPath)
+}
+
+export function compactUrl(url: URL, config: OpenAICompactConfig = defaultConfig): string {
+  const next = new URL(url.href)
+  const path = pathWithoutTrailingSlash(next.pathname)
+  const prefix = path.slice(0, path.length - config.responses.endpointPath.length)
+  next.pathname = `${prefix}${config.responses.compactEndpointPath}`
+  return next.href
+}
+
+function requestHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined)
+  new Headers(init?.headers).forEach((value, key) => headers.set(key, value))
+  return headers
+}
+
+function cleanedHeaders(headers: Headers, config: OpenAICompactConfig): Headers {
+  const result = new Headers(headers)
+  result.delete(config.headers.compact)
+  result.delete(config.headers.session)
+  return result
+}
+
+function fetchInit(init: RequestInit | undefined, headers: Headers): RequestInit {
+  return init ? { ...init, headers } : { headers }
+}
+
+function compactMarkers(headers: Headers, config: OpenAICompactConfig) {
+  const sessionID = headers.get(config.headers.session) ?? undefined
+  const shouldCompact = headers.get(config.headers.compact) === "1"
+  headers.delete(config.headers.compact)
+  headers.delete(config.headers.session)
+  return { sessionID, shouldCompact }
+}
+
+async function bodyText(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
+  if (typeof init?.body === "string") return init.body
+  if (init?.body instanceof Uint8Array) return new TextDecoder().decode(init.body)
+  if (input instanceof Request) return input.clone().text()
+  return undefined
+}
+
+export function compactBody(
+  body: AnyRecord,
+  compactModel = defaultConfig.providers.openai.compactModel,
+  config: OpenAICompactConfig = defaultConfig,
+): AnyRecord {
+  const result: AnyRecord = { model: compactModel }
+  for (const key of config.compactBodyKeys) {
+    if (body[key] !== undefined) result[key] = body[key]
+  }
+  return result
+}
+
+export function compactedItemsFrom(value: unknown): AnyRecord[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const items = value
+    .map(asRecord)
+    .filter((item): item is AnyRecord => item !== undefined)
+    .map((item) =>
+      item.type === "compaction_summary" && typeof item.encrypted_content === "string"
+        ? { type: "compaction", encrypted_content: item.encrypted_content }
+        : item,
+    )
+  return items.length ? items : undefined
+}
+
+function parseJsonRecord(text: string | undefined): AnyRecord | undefined {
+  if (!text) return undefined
+  try {
+    return asRecord(JSON.parse(text))
+  } catch {
+    return undefined
+  }
+}
+
+function usageFrom(value: AnyRecord | undefined): AnyRecord {
+  return {
+    input_tokens: value?.input_tokens ?? 0,
+    input_tokens_details: {
+      cached_tokens: asRecord(value?.input_tokens_details)?.cached_tokens ?? 0,
+    },
+    output_tokens: value?.output_tokens ?? 0,
+    output_tokens_details: {
+      reasoning_tokens: asRecord(value?.output_tokens_details)?.reasoning_tokens ?? 0,
+    },
+    total_tokens: value?.total_tokens ?? Number(value?.input_tokens ?? 0) + Number(value?.output_tokens ?? 0),
+  }
+}
+
+function sseResponse(input: {
+  responseID: string
+  model: string
+  createdAt: number
+  summary: string
+  usage?: AnyRecord
+}): Response {
+  const messageID = `msg_${input.responseID.replace(/[^a-zA-Z0-9]/g, "_")}`
+  const usage = usageFrom(input.usage)
+  const message = {
+    id: messageID,
+    type: "message",
+    status: "completed",
+    role: "assistant",
+    content: [
+      {
+        type: "output_text",
+        text: input.summary,
+        annotations: [],
+        logprobs: [],
+      },
+    ],
+  }
+  const response = {
+    id: input.responseID,
+    object: "response",
+    created_at: input.createdAt,
+    model: input.model,
+    status: "completed",
+    output: [message],
+    incomplete_details: null,
+    service_tier: null,
+    usage,
+  }
+  const events = [
+    { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { ...message, status: "in_progress", content: [] } },
+    {
+      type: "response.output_text.delta",
+      item_id: messageID,
+      output_index: 0,
+      content_index: 0,
+      delta: input.summary,
+      logprobs: [],
+    },
+    { type: "response.output_item.done", output_index: 0, item: message },
+    { type: "response.completed", response },
+  ]
+  const stream = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+    },
+  })
+}
+
+function selectCheckpoint(checkpoints: Checkpoint[], entries: MessageEntry[]): Checkpoint | undefined {
+  const messageIDs = new Set(
+    entries
+      .map((entry) => entry.info?.id)
+      .filter((id): id is string => typeof id === "string"),
+  )
+  for (let index = checkpoints.length - 1; index >= 0; index--) {
+    const checkpoint = checkpoints[index]
+    if (messageIDs.has(checkpoint.afterMessageID)) return checkpoint
+  }
+
+  return undefined
+}
+
+function sessionIDFromMessages(messages: MessageEntry[]): string | undefined {
+  for (const message of messages) {
+    const sessionID = (message.info as AnyRecord | undefined)?.sessionID
+    if (typeof sessionID === "string") return sessionID
+  }
+  return undefined
+}
+
+function sortCheckpoints(checkpoints: Checkpoint[]) {
+  return checkpoints.sort((a, b) => a.afterCreatedAt - b.afterCreatedAt || a.createdAt - b.createdAt)
+}
+
+function getProviderSessionMap<T>(map: Map<string, Map<string, T>>, providerID: string) {
+  const existing = map.get(providerID)
+  if (existing) return existing
+
+  const created = new Map<string, T>()
+  map.set(providerID, created)
+  return created
+}
+
+function getProviderID(input: unknown) {
+  const record = asRecord(input)
+  const model = asRecord(record?.model)
+  if (typeof model?.providerID === "string") return model.providerID
+
+  const provider = asRecord(record?.provider)
+  if (typeof provider?.providerID === "string") return provider.providerID
+  if (typeof provider?.id === "string") return provider.id
+  return undefined
+}
+
+function messageProviderKey(sessionID: string, messageID: string) {
+  return `${sessionID}\0${messageID}`
+}
+
+export function createCompactHooks(config: OpenAICompactConfig, store: CheckpointStore, baseFetch: FetchLike = fetch): Hooks {
+  store.prune(config.state.retentionDays)
+
+  const configuredProviders = new Set(Object.keys(config.providers))
+  const checkpointsByProvider = new Map<string, Map<string, Checkpoint[]>>()
+  for (const { sessionID, checkpoint } of store.loadAll()) {
+    const sessions = getProviderSessionMap(checkpointsByProvider, checkpoint.providerID)
+    const checkpoints = sessions.get(sessionID) ?? []
+    checkpoints.push(checkpoint)
+    sessions.set(sessionID, sortCheckpoints(checkpoints))
+  }
+  const pendingCompactResults = new Map<string, PendingCompactResult>()
+  const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
+  const providerByMessage = new Map<string, string>()
+
+  function rememberMessageProvider(input: unknown, output: unknown) {
+    const providerID = getProviderID(input)
+    if (!providerID || !configuredProviders.has(providerID)) return
+
+    const inputRecord = asRecord(input)
+    const sessionID = inputRecord?.sessionID
+    if (typeof sessionID !== "string") return
+
+    const outputRecord = asRecord(output)
+    const message = asRecord(outputRecord?.message)
+    const messageID = typeof message?.id === "string" ? message.id : inputRecord?.messageID
+    if (typeof messageID !== "string") return
+
+    providerByMessage.set(messageProviderKey(sessionID, messageID), providerID)
+  }
+
+  function providerIDFromMessages(messages: MessageEntry[]) {
+    for (const message of messages) {
+      const sessionID = (message.info as AnyRecord | undefined)?.sessionID
+      const messageID = message.info?.id
+      if (typeof sessionID !== "string" || typeof messageID !== "string") continue
+      const providerID = providerByMessage.get(messageProviderKey(sessionID, messageID))
+      if (providerID) return providerID
+    }
+    return undefined
+  }
+
+  function transformProviderID(input: unknown, messages: MessageEntry[]) {
+    return getProviderID(input) ?? providerIDFromMessages(messages)
+  }
+
+  function addCheckpoint(
+    providerID: string,
+    sessionID: string,
+    responseID: string,
+    boundary: MessageBoundary,
+    items: AnyRecord[],
+  ): Checkpoint {
+    const checkpoint: Checkpoint = {
+      providerID,
+      responseID,
+      afterMessageID: boundary.messageID,
+      afterCreatedAt: boundary.createdAt,
+      createdAt: Date.now(),
+      items,
+    }
+    const sessions = getProviderSessionMap(checkpointsByProvider, providerID)
+    const checkpoints = sessions.get(sessionID) ?? []
+    sessions.set(
+      sessionID,
+      sortCheckpoints([...checkpoints.filter((checkpoint) => checkpoint.responseID !== responseID), checkpoint]),
+    )
+    store.upsert(sessionID, checkpoint)
+    store.prune(config.state.retentionDays)
+    return checkpoint
+  }
+
+  function compactCheckpointFromEvent(event: AnyRecord) {
+    if (event.type !== "message.part.updated") return undefined
+    const properties = asRecord(event.properties)
+    const sessionID = properties?.sessionID
+    const pending = typeof sessionID === "string" ? pendingCompactResults.get(sessionID) : undefined
+    const part = asRecord(properties?.part)
+    const messageID = part?.messageID
+    const createdAt = properties?.time
+    if (!pending || part?.text !== config.summary) return undefined
+    if (typeof sessionID !== "string" || typeof messageID !== "string" || !finiteNumber(createdAt)) return undefined
+    return { providerID: pending.providerID, sessionID, responseID: pending.responseID, boundary: { messageID, createdAt } }
+  }
+
+  function trimMessagesAfterCheckpoint(providerID: string, messages: MessageEntry[]) {
+    const sessionID = sessionIDFromMessages(messages)
+    const checkpoints = sessionID ? checkpointsByProvider.get(providerID)?.get(sessionID) : undefined
+    if (!sessionID || !checkpoints) return
+
+    const checkpoint = selectCheckpoint(checkpoints, messages)
+    const activeCheckpoints = getProviderSessionMap(activeCheckpointByProvider, providerID)
+    if (checkpoint) {
+      activeCheckpoints.set(sessionID, checkpoint)
+    } else {
+      activeCheckpoints.delete(sessionID)
+    }
+    if (!checkpoint) return
+
+    const index = messages.findIndex((message) => message.info?.id === checkpoint.afterMessageID)
+    if (index === -1) return
+
+    const trimmed = messages.slice(index + 1)
+    if (trimmed.length) {
+      messages.splice(0, messages.length, ...trimmed)
+    }
+  }
+
+  async function initWithCompactedInput(
+    providerID: string,
+    requestInput: RequestInfo | URL,
+    init: RequestInit | undefined,
+    headers: Headers,
+    sessionID: string,
+  ): Promise<RequestInit> {
+    const body = parseJsonRecord(await bodyText(requestInput, init))
+    if (!body || !Array.isArray(body.input)) {
+      return fetchInit(init, headers)
+    }
+
+    const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
+    if (!checkpoint) return fetchInit(init, headers)
+
+    headers.set("content-type", "application/json")
+    const next = {
+      ...body,
+      input: [...structuredClone(checkpoint.items), ...body.input],
+    }
+    return { ...init, headers, body: JSON.stringify(next) }
+  }
+
+  function wrapFetch(base: FetchLike, providerID: string, provider: ProviderConfig): FetchLike {
+    if ((base as unknown as AnyRecord)[wrappedFetch]) return base
+
+    const wrapped = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlOf(requestInput)
+      const headers = requestHeaders(requestInput, init)
+      const { sessionID: headerSessionID, shouldCompact } = compactMarkers(headers, config)
+      const isResponsesRequest = url ? isResponsesUrl(url, config) : false
+      const outboundHeaders = cleanedHeaders(headers, config)
+
+      if (!isResponsesRequest) {
+        return base(requestInput, fetchInit(init, outboundHeaders))
+      }
+
+      const sessionID = headerSessionID
+      if (!sessionID) {
+        return base(requestInput, fetchInit(init, outboundHeaders))
+      }
+
+      const requestInit = await initWithCompactedInput(providerID, requestInput, init, outboundHeaders, sessionID)
+      if (!shouldCompact) {
+        return base(requestInput, requestInit)
+      }
+
+      const body = parseJsonRecord(typeof requestInit.body === "string" ? requestInit.body : undefined)
+      if (!body?.model || !body.input || !url) {
+        return base(requestInput, requestInit)
+      }
+
+      const compactHeaders = new Headers(requestInit.headers)
+      compactHeaders.set("content-type", "application/json")
+      const compacted = await base(compactUrl(url, config), {
+        ...requestInit,
+        method: "POST",
+        headers: compactHeaders,
+        body: JSON.stringify(compactBody(body, provider.compactModel, config)),
+      })
+      if (!compacted.ok) {
+        return compacted
+      }
+
+      const payload = asRecord(await compacted.clone().json().catch(() => undefined))
+      const responseID = typeof payload?.id === "string" ? payload.id : undefined
+      const items = compactedItemsFrom(payload?.output)
+      if (!responseID || !items) {
+        return compacted
+      }
+
+      pendingCompactResults.set(sessionID, { providerID, responseID, items })
+      return sseResponse({
+        responseID,
+        model: typeof payload?.model === "string" ? payload.model : provider.compactModel,
+        createdAt: typeof payload?.created_at === "number" ? payload.created_at : Math.floor(Date.now() / 1000),
+        summary: config.summary,
+        usage: asRecord(payload?.usage),
+      })
+    }) as FetchLike
+
+    Object.defineProperty(wrapped, wrappedFetch, { value: true })
+    return wrapped
+  }
+
+  async function handleEvent(event: AnyRecord) {
+    if (event.type === "session.deleted") {
+      const sessionID = asRecord(event.properties)?.sessionID
+      if (typeof sessionID !== "string") return
+      for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
+      pendingCompactResults.delete(sessionID)
+      for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
+      for (const key of providerByMessage.keys()) {
+        if (key.startsWith(`${sessionID}\0`)) providerByMessage.delete(key)
+      }
+      if (config.state.deleteOnSessionDeleted) store.deleteSession(sessionID)
+      return
+    }
+
+    const compact = compactCheckpointFromEvent(event)
+    if (!compact) return
+    const pending = pendingCompactResults.get(compact.sessionID)
+    if (pending?.responseID !== compact.responseID) return
+    pendingCompactResults.delete(compact.sessionID)
+    const checkpoint = addCheckpoint(compact.providerID, compact.sessionID, compact.responseID, compact.boundary, pending.items)
+    getProviderSessionMap(activeCheckpointByProvider, compact.providerID).set(compact.sessionID, checkpoint)
+  }
+
+  const hooks: Hooks = {
+    async dispose() {
+      store.close()
+    },
+
+    async config(cfg) {
+      const root = cfg as AnyRecord
+      root.provider ??= {}
+      const providers = root.provider as AnyRecord
+      for (const [providerID, compactProvider] of Object.entries(config.providers)) {
+        providers[providerID] ??= {}
+        const provider = providers[providerID] as AnyRecord
+        provider.options ??= {}
+        const options = provider.options as AnyRecord
+        options.fetch = wrapFetch((options.fetch as FetchLike | undefined) ?? baseFetch, providerID, compactProvider)
+      }
+    },
+
+    async event(input) {
+      await handleEvent(input.event as AnyRecord)
+    },
+
+    "chat.message": async (input, output) => {
+      rememberMessageProvider(input, output)
+    },
+
+    "chat.headers": async (input, output) => {
+      const providerID = getProviderID(input)
+      if (!providerID || !configuredProviders.has(providerID)) return
+      if (typeof input.sessionID !== "string") return
+
+      output.headers[config.headers.session] = input.sessionID
+
+      if (input.agent !== "compaction") return
+      output.headers[config.headers.compact] = "1"
+    },
+
+    "experimental.chat.messages.transform": async (input, output) => {
+      const messages = output.messages as unknown as MessageEntry[]
+      const providerID = transformProviderID(input, messages)
+      if (!providerID || !configuredProviders.has(providerID)) return
+      trimMessagesAfterCheckpoint(providerID, messages)
+    },
+  }
+
+  return hooks
+}

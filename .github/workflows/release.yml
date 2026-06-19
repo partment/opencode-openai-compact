@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.6.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify tag matches package version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version v$VERSION"
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Publish to npm
+        run: npm publish --provenance
+
+      - name: Verify published version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          for attempt in 1 2 3 4 5; do
+            PUBLISHED=$(npm view "opencode-openai-compact@$VERSION" version --json 2>/dev/null || true)
+            if [ "$PUBLISHED" = "\"$VERSION\"" ]; then
+              echo "Published opencode-openai-compact@$VERSION"
+              exit 0
+            fi
+            echo "Package not visible yet; retrying ($attempt/5)..."
+            sleep 10
+          done
+          echo "Failed to verify opencode-openai-compact@$VERSION on npm"
+          exit 1
