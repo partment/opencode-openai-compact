@@ -1,5 +1,7 @@
 # opencode-openai-compact
 
+[![npm version](https://img.shields.io/npm/v/opencode-openai-compact?style=flat-square)](https://www.npmjs.com/package/opencode-openai-compact)
+
 OpenCode plugin that lets OpenCode use OpenAI's official Responses API compaction.
 
 ## Installation
@@ -124,7 +126,17 @@ Runtime checkpoints are stored in SQLite at:
 | `retentionDays` | `integer` | `30` | Number of days to keep checkpoints. |
 | `deleteOnSessionDeleted` | `boolean` | `true` | Deletes checkpoints when OpenCode emits `session.deleted`. |
 
-`compactionAgent` is intentionally not configurable. OpenCode uses the fixed `compaction` agent for compaction.
+## Star us on Github
+
+<p align="center">
+  <a href="https://www.star-history.com/#partment/opencode-openai-compact&type=date&legend=bottom-right">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=partment/opencode-openai-compact&type=date&theme=dark&legend=bottom-right" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=partment/opencode-openai-compact&type=date&legend=bottom-right" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=partment/opencode-openai-compact&type=date&legend=bottom-right" />
+    </picture>
+  </a>
+</p>
 
 ## Development
 
