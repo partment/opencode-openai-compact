@@ -4,14 +4,18 @@ import { createCompactHooks } from "./compact.js"
 import { getDatabasePath } from "./paths.js"
 import { CheckpointStore } from "./state.js"
 
-export const server: Plugin = async ({ directory, worktree }) => {
+export const server: Plugin = async ({ client, directory, worktree }) => {
   const config = await loadConfig({ directory, worktree })
   if (!config.enabled) return {}
 
   const store = await CheckpointStore.open(getDatabasePath())
   store.prune(config.state.retentionDays)
 
-  return createCompactHooks(config, store)
+  return createCompactHooks(config, store, fetch, {
+    async setOpenAIAuth(auth) {
+      await client.auth.set({ path: { id: "openai" }, body: auth as any })
+    },
+  })
 }
 
 export default {

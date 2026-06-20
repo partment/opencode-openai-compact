@@ -1,5 +1,14 @@
 import type { Hooks } from "@opencode-ai/plugin"
 import { defaultConfig, type OpenAICompactConfig } from "./schema.js"
+import {
+  asOpenAIOAuth,
+  createOpenAIOAuth,
+  openAIAuthMethods,
+  openAIOAuthDummyKey,
+  usesOpenAIOAuth,
+  type OpenAIOAuthAuth,
+  type OAuthFetchLike,
+} from "./oauth.js"
 import { CheckpointStore, type AnyRecord, type Checkpoint } from "./state.js"
 
 type FetchLike = typeof fetch
@@ -10,8 +19,15 @@ type MessageEntry = {
 type MessageBoundary = { messageID: string; createdAt: number }
 type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
 type ProviderConfig = OpenAICompactConfig["providers"][string]
+type CompactHookOptions = {
+  setOpenAIAuth?: (auth: OpenAIOAuthAuth) => Promise<void>
+  tokenFetch?: OAuthFetchLike
+}
 
 const wrappedFetch = "__opencodeOpenAICompactFetch"
+const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
+const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
+const chatGPTCodexCompactEndpoint = "https://chatgpt.com/backend-api/codex/responses/compact"
 
 function asRecord(value: unknown): AnyRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
@@ -127,6 +143,10 @@ function usageFrom(value: AnyRecord | undefined): AnyRecord {
   }
 }
 
+function responseMessageID(responseID: string) {
+  return `msg_${responseID.replace(/[^a-zA-Z0-9]/g, "_")}`
+}
+
 function sseResponse(input: {
   responseID: string
   model: string
@@ -134,7 +154,7 @@ function sseResponse(input: {
   summary: string
   usage?: AnyRecord
 }): Response {
-  const messageID = `msg_${input.responseID.replace(/[^a-zA-Z0-9]/g, "_")}`
+  const messageID = responseMessageID(input.responseID)
   const usage = usageFrom(input.usage)
   const message = {
     id: messageID,
@@ -185,7 +205,15 @@ function sseResponse(input: {
   })
 }
 
-function selectCheckpoint(checkpoints: Checkpoint[], entries: MessageEntry[]): Checkpoint | undefined {
+function messageCreatedAt(entry: MessageEntry) {
+  const createdAt = entry.info?.time?.created
+  return finiteNumber(createdAt) ? createdAt : undefined
+}
+
+function selectCheckpoint(
+  checkpoints: Checkpoint[],
+  entries: MessageEntry[],
+): { checkpoint?: Checkpoint; clearActive: boolean } {
   const messageIDs = new Set(
     entries
       .map((entry) => entry.info?.id)
@@ -193,10 +221,21 @@ function selectCheckpoint(checkpoints: Checkpoint[], entries: MessageEntry[]): C
   )
   for (let index = checkpoints.length - 1; index >= 0; index--) {
     const checkpoint = checkpoints[index]
-    if (messageIDs.has(checkpoint.afterMessageID)) return checkpoint
+    if (messageIDs.has(checkpoint.afterMessageID)) return { checkpoint, clearActive: false }
   }
 
-  return undefined
+  const createdAts = entries.map(messageCreatedAt).filter((createdAt): createdAt is number => createdAt !== undefined)
+  if (!createdAts.length || createdAts.length !== entries.length) {
+    return { clearActive: false }
+  }
+
+  const minCreatedAt = Math.min(...createdAts)
+  for (let index = checkpoints.length - 1; index >= 0; index--) {
+    const checkpoint = checkpoints[index]
+    if (minCreatedAt >= checkpoint.afterCreatedAt) return { checkpoint, clearActive: false }
+  }
+
+  return { clearActive: true }
 }
 
 function sessionIDFromMessages(messages: MessageEntry[]): string | undefined {
@@ -235,7 +274,12 @@ function messageProviderKey(sessionID: string, messageID: string) {
   return `${sessionID}\0${messageID}`
 }
 
-export function createCompactHooks(config: OpenAICompactConfig, store: CheckpointStore, baseFetch: FetchLike = fetch): Hooks {
+export function createCompactHooks(
+  config: OpenAICompactConfig,
+  store: CheckpointStore,
+  baseFetch: FetchLike = fetch,
+  options: CompactHookOptions = {},
+): Hooks {
   store.prune(config.state.retentionDays)
 
   const configuredProviders = new Set(Object.keys(config.providers))
@@ -249,6 +293,12 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
   const pendingCompactResults = new Map<string, PendingCompactResult>()
   const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
   const providerByMessage = new Map<string, string>()
+  let getOpenAIAuth: (() => Promise<OpenAIOAuthAuth | undefined>) | undefined
+  const openAIOAuth = createOpenAIOAuth({
+    getAuth: async () => getOpenAIAuth?.(),
+    setAuth: options.setOpenAIAuth,
+    tokenFetch: options.tokenFetch,
+  })
 
   function rememberMessageProvider(input: unknown, output: unknown) {
     const providerID = getProviderID(input)
@@ -277,8 +327,28 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
     return undefined
   }
 
+  function providerIDFromTrimmedSessionCheckpoint(messages: MessageEntry[]) {
+    const sessionID = sessionIDFromMessages(messages)
+    if (!sessionID) return undefined
+
+    const messageIDs = new Set(
+      messages
+        .map((message) => message.info?.id)
+        .filter((id): id is string => typeof id === "string"),
+    )
+    let result: string | undefined
+    for (const [providerID, sessions] of checkpointsByProvider) {
+      const checkpoints = sessions.get(sessionID)
+      if (!checkpoints?.length) continue
+      if (checkpoints.some((checkpoint) => messageIDs.has(checkpoint.afterMessageID))) return undefined
+      if (result) return undefined
+      result = providerID
+    }
+    return result
+  }
+
   function transformProviderID(input: unknown, messages: MessageEntry[]) {
-    return getProviderID(input) ?? providerIDFromMessages(messages)
+    return getProviderID(input) ?? providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
   }
 
   function addCheckpoint(
@@ -325,11 +395,11 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
     const checkpoints = sessionID ? checkpointsByProvider.get(providerID)?.get(sessionID) : undefined
     if (!sessionID || !checkpoints) return
 
-    const checkpoint = selectCheckpoint(checkpoints, messages)
+    const { checkpoint, clearActive } = selectCheckpoint(checkpoints, messages)
     const activeCheckpoints = getProviderSessionMap(activeCheckpointByProvider, providerID)
     if (checkpoint) {
       activeCheckpoints.set(sessionID, checkpoint)
-    } else {
+    } else if (clearActive) {
       activeCheckpoints.delete(sessionID)
     }
     if (!checkpoint) return
@@ -367,7 +437,8 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
   }
 
   function wrapFetch(base: FetchLike, providerID: string, provider: ProviderConfig): FetchLike {
-    if ((base as unknown as AnyRecord)[wrappedFetch]) return base
+    const previousBase = (base as unknown as AnyRecord)[wrappedBaseFetch]
+    const baseFetch = typeof previousBase === "function" ? (previousBase as FetchLike) : base
 
     const wrapped = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       const url = urlOf(requestInput)
@@ -377,30 +448,35 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
       const outboundHeaders = cleanedHeaders(headers, config)
 
       if (!isResponsesRequest) {
-        return base(requestInput, fetchInit(init, outboundHeaders))
+        return baseFetch(requestInput, fetchInit(init, outboundHeaders))
       }
 
       const sessionID = headerSessionID
       if (!sessionID) {
-        return base(requestInput, fetchInit(init, outboundHeaders))
+        return baseFetch(requestInput, fetchInit(init, outboundHeaders))
       }
 
       const requestInit = await initWithCompactedInput(providerID, requestInput, init, outboundHeaders, sessionID)
+      const openAIOAuthRequestInit = usesOpenAIOAuth(providerID, new Headers(requestInit.headers))
+        ? await openAIOAuth.requestInit(requestInit)
+        : undefined
+      const routedRequestInput = openAIOAuthRequestInit ? chatGPTCodexResponsesEndpoint : requestInput
+      const routedRequestInit = openAIOAuthRequestInit ?? requestInit
       if (!shouldCompact) {
-        return base(requestInput, requestInit)
+        return baseFetch(routedRequestInput, routedRequestInit)
       }
 
-      const body = parseJsonRecord(typeof requestInit.body === "string" ? requestInit.body : undefined)
+      const body = parseJsonRecord(typeof routedRequestInit.body === "string" ? routedRequestInit.body : undefined)
       if (!body?.model || !body.input || !url) {
-        return base(requestInput, requestInit)
+        return baseFetch(routedRequestInput, routedRequestInit)
       }
 
-      const compactHeaders = new Headers(requestInit.headers)
-      compactHeaders.set("content-type", "application/json")
-      const compacted = await base(compactUrl(url, config), {
-        ...requestInit,
+      const outboundCompactHeaders = new Headers(routedRequestInit.headers)
+      outboundCompactHeaders.set("content-type", "application/json")
+      const compacted = await baseFetch(openAIOAuthRequestInit ? chatGPTCodexCompactEndpoint : compactUrl(url, config), {
+        ...routedRequestInit,
         method: "POST",
-        headers: compactHeaders,
+        headers: outboundCompactHeaders,
         body: JSON.stringify(compactBody(body, provider.compactModel, config)),
       })
       if (!compacted.ok) {
@@ -414,7 +490,15 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
         return compacted
       }
 
+      const checkpoint = addCheckpoint(
+        providerID,
+        sessionID,
+        responseID,
+        { messageID: responseMessageID(responseID), createdAt: Date.now() },
+        items,
+      )
       pendingCompactResults.set(sessionID, { providerID, responseID, items })
+      getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
       return sseResponse({
         responseID,
         model: typeof payload?.model === "string" ? payload.model : provider.compactModel,
@@ -425,6 +509,7 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
     }) as FetchLike
 
     Object.defineProperty(wrapped, wrappedFetch, { value: true })
+    Object.defineProperty(wrapped, wrappedBaseFetch, { value: baseFetch })
     return wrapped
   }
 
@@ -452,6 +537,19 @@ export function createCompactHooks(config: OpenAICompactConfig, store: Checkpoin
   }
 
   const hooks: Hooks = {
+    auth: {
+      provider: "openai",
+      methods: openAIAuthMethods,
+      async loader(getAuth) {
+        getOpenAIAuth = async () => asOpenAIOAuth(await getAuth())
+        const auth = await getAuth()
+        const apiAuth = asRecord(auth)
+        if (asOpenAIOAuth(auth)) return { apiKey: openAIOAuthDummyKey }
+        if (apiAuth?.type === "api" && typeof apiAuth.key === "string") return { apiKey: apiAuth.key }
+        return {}
+      },
+    },
+
     async dispose() {
       store.close()
     },
