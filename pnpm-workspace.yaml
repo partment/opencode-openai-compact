@@ -1,4 +1,2 @@
 allowBuilds:
   msgpackr-extract: false
-minimumReleaseAgeExclude:
-  - '@types/node@26.0.0'
