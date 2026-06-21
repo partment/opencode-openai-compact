@@ -71,6 +71,227 @@ describe("OpenAI compact hooks", () => {
     })
   })
 
+  test("keeps session instructions when routing compaction", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response(
+        JSON.stringify({
+          id: "resp_compacted",
+          created_at: 1,
+          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: "ses_instructions" },
+        body: JSON.stringify({
+          model: "gpt",
+          instructions: "You are OpenCode.",
+          input: [{ role: "developer", content: "stable instructions" }, { role: "user", content: "hello" }],
+        }),
+      })
+
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: "ses_instructions" },
+        body: JSON.stringify({
+          model: "gpt",
+          input: [{ role: "developer", content: "stable instructions" }, { role: "user", content: "next" }],
+        }),
+      })
+
+      calls.length = 0
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: "ses_instructions",
+        },
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+          input: [
+            {
+              role: "developer",
+              content: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+            },
+            { role: "user", content: "hello" },
+            { role: "assistant", content: [{ type: "output_text", text: "done" }] },
+            { role: "user", content: "Create a new anchored summary from the conversation history.\n\nOutput exactly..." },
+          ],
+        }),
+      })
+
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(jsonBody(calls[0]?.init)).toEqual({
+        model: defaultCompactModel,
+        instructions: "You are OpenCode.",
+        input: [
+          { role: "developer", content: "stable instructions" },
+          { role: "user", content: "hello" },
+          { role: "assistant", content: [{ type: "output_text", text: "done" }] },
+        ],
+      })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("keeps rendered system instructions when routing compaction", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response(
+        JSON.stringify({
+          id: "resp_compacted",
+          created_at: 1,
+          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      await hooks["experimental.chat.system.transform"]?.(
+        { sessionID: "ses_rendered", model: { providerID: "openai" } } as any,
+        { system: ["You are OpenCode.", " ", "AGENTS instructions"] },
+      )
+      await hooks["chat.headers"]?.(
+        { sessionID: "ses_rendered", agent: "build", model: { providerID: "openai" } } as any,
+        { headers: {} },
+      )
+
+      for (const agent of ["title", "summary"]) {
+        const utilityHeaders = { headers: {} as Record<string, string> }
+        await hooks["experimental.chat.system.transform"]?.(
+          { sessionID: "ses_rendered", model: { providerID: "openai" } } as any,
+          { system: [`${agent} prompt`] },
+        )
+        await hooks["chat.headers"]?.(
+          { sessionID: "ses_rendered", agent, model: { providerID: "openai" } } as any,
+          utilityHeaders,
+        )
+        expect(utilityHeaders.headers).toEqual({})
+      }
+
+      await hooks["experimental.chat.system.transform"]?.(
+        { sessionID: "ses_rendered", model: { providerID: "openai" } } as any,
+        { system: ["You are an anchored context summarization assistant for coding sessions.\n\nSummarize only..."] },
+      )
+      const compactHeaders = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        { sessionID: "ses_rendered", agent: "compaction", model: { providerID: "openai" } } as any,
+        compactHeaders,
+      )
+
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: compactHeaders.headers,
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+          input: [
+            {
+              role: "developer",
+              content: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+            },
+            { role: "user", content: "hello" },
+            { role: "assistant", content: [{ type: "output_text", text: "done" }] },
+            { role: "user", content: "Create a new anchored summary from the conversation history.\n\nOutput exactly..." },
+          ],
+        }),
+      })
+
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(jsonBody(calls[0]?.init)).toEqual({
+        model: defaultCompactModel,
+        instructions: "You are OpenCode.\n \nAGENTS instructions",
+        input: [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: [{ type: "output_text", text: "done" }] },
+        ],
+      })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("does not restore stable instructions when config omits instructions", async () => {
+    const config = OpenAICompactConfigSchema.parse({ compactBodyKeys: ["input"] })
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response(
+        JSON.stringify({
+          id: "resp_compacted",
+          created_at: 1,
+          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(config, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [config.headers.session]: "ses_no_instructions" },
+        body: JSON.stringify({
+          model: "gpt",
+          instructions: "You are OpenCode.",
+          input: [{ role: "developer", content: "stable instructions" }, { role: "user", content: "hello" }],
+        }),
+      })
+
+      calls.length = 0
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [config.headers.compact]: "1",
+          [config.headers.session]: "ses_no_instructions",
+        },
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          input: [
+            { role: "developer", content: "You are an anchored context summarization assistant for coding sessions." },
+            { role: "user", content: "hello" },
+            { role: "user", content: "Create a new anchored summary from the conversation history.\n\nOutput exactly..." },
+          ],
+        }),
+      })
+
+      expect(jsonBody(calls[0]?.init)).toEqual({
+        model: defaultCompactModel,
+        input: [{ role: "developer", content: "stable instructions" }, { role: "user", content: "hello" }],
+      })
+    } finally {
+      store.close()
+    }
+  })
+
   test("wraps multiple providers with their own compact models", async () => {
     const config = OpenAICompactConfigSchema.parse({
       providers: {
@@ -168,12 +389,24 @@ describe("OpenAI compact hooks", () => {
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
         headers: { [defaultConfig.headers.session]: "ses_request" },
-        body: JSON.stringify({ model: "gpt", input: [{ role: "user", content: "after compact" }] }),
+        body: JSON.stringify({
+          model: "gpt",
+          input: [
+            { role: "developer", content: "stable instructions" },
+            { role: "system", content: "more stable instructions" },
+            { role: "user", content: "after compact" },
+          ],
+        }),
       })
 
       const followupBody = jsonBody(calls[0]?.init)
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
-      expect(followupBody.input[0]).toEqual({ type: "compaction", encrypted_content: "compacted" })
+      expect(followupBody.input).toEqual([
+        { role: "developer", content: "stable instructions" },
+        { role: "system", content: "more stable instructions" },
+        { type: "compaction", encrypted_content: "compacted" },
+        { role: "user", content: "after compact" },
+      ])
 
       const unknownProviderMessages = [
         { info: { id: "msg_checkpoint", sessionID: "ses_request" } },

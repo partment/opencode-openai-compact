@@ -19,6 +19,7 @@ type MessageEntry = {
 type MessageBoundary = { messageID: string; createdAt: number }
 type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
 type ProviderConfig = OpenAICompactConfig["providers"][string]
+type StableInstructions = { instructions?: unknown; inputPrefix: unknown[] }
 type CompactHookOptions = {
   setOpenAIAuth?: (auth: OpenAIOAuthAuth) => Promise<void>
   tokenFetch?: OAuthFetchLike
@@ -29,6 +30,7 @@ const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
 const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 const chatGPTCodexCompactEndpoint = "https://chatgpt.com/backend-api/codex/responses/compact"
 const openCodeCompactionDeveloperPrompt = "You are an anchored context summarization assistant for coding sessions."
+const utilityAgents = new Set(["compaction", "title", "summary"])
 const openCodeCompactionUserPromptStarts = [
   "Create a new anchored summary from the conversation history.",
   "Update the anchored summary below using the conversation history above.",
@@ -139,6 +141,45 @@ function compactBodyValue(key: string, value: unknown) {
   if (key === "input") return compactInput(value)
   if (key === "instructions" && isOpenCodeCompactionDeveloperPrompt(value)) return undefined
   return value
+}
+
+function leadingInstructionCount(input: unknown[]) {
+  let index = 0
+  while (true) {
+    const role = asRecord(input[index])?.role
+    if (role !== "developer" && role !== "system") return index
+    index++
+  }
+}
+
+function stableInstructionsFrom(body: AnyRecord | undefined): StableInstructions | undefined {
+  if (!body) return undefined
+
+  const inputPrefix = Array.isArray(body.input) ? body.input.slice(0, leadingInstructionCount(body.input)) : []
+  const instructions = isOpenCodeCompactionDeveloperPrompt(body.instructions) ? undefined : body.instructions
+  if (instructions === undefined && !inputPrefix.length) return undefined
+  return { instructions, inputPrefix: structuredClone(inputPrefix) }
+}
+
+function instructionsFromSystem(system: unknown) {
+  if (!Array.isArray(system)) return undefined
+  if (!system.every((item): item is string => typeof item === "string")) return undefined
+  const instructions = system.join("\n")
+  if (!instructions || isOpenCodeCompactionDeveloperPrompt(instructions)) return undefined
+  return instructions
+}
+
+function withStableInstructions(body: AnyRecord, stable: StableInstructions | undefined, allowInstructions: boolean): AnyRecord {
+  if (!stable) return body
+
+  const next = { ...body }
+  if (allowInstructions && next.instructions === undefined && stable.instructions !== undefined) {
+    next.instructions = structuredClone(stable.instructions)
+  }
+  if (stable.inputPrefix.length && Array.isArray(next.input)) {
+    next.input = [...structuredClone(stable.inputPrefix), ...next.input.slice(leadingInstructionCount(next.input))]
+  }
+  return next
 }
 
 export function compactBody(
@@ -339,6 +380,8 @@ export function createCompactHooks(
   }
   const pendingCompactResults = new Map<string, PendingCompactResult>()
   const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
+  const stableInstructionsByProvider = new Map<string, Map<string, StableInstructions>>()
+  const pendingSystemByProvider = new Map<string, Map<string, string>>()
   const providerByMessage = new Map<string, string>()
   let getOpenAIAuth: (() => Promise<OpenAIOAuthAuth | undefined>) | undefined
   const openAIOAuth = createOpenAIOAuth({
@@ -396,6 +439,35 @@ export function createCompactHooks(
 
   function transformProviderID(input: unknown, messages: MessageEntry[]) {
     return getProviderID(input) ?? providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
+  }
+
+  function storeStableInstructions(providerID: string, sessionID: string, stable: StableInstructions) {
+    const sessions = getProviderSessionMap(stableInstructionsByProvider, providerID)
+    const previous = sessions.get(sessionID)
+    sessions.set(sessionID, {
+      instructions: stable.instructions !== undefined ? stable.instructions : previous?.instructions,
+      inputPrefix: stable.inputPrefix.length ? stable.inputPrefix : (previous?.inputPrefix ?? []),
+    })
+  }
+
+  function rememberStableInstructions(providerID: string, sessionID: string, body: AnyRecord | undefined) {
+    const stable = stableInstructionsFrom(body)
+    if (stable) storeStableInstructions(providerID, sessionID, stable)
+  }
+
+  function rememberPendingSystem(providerID: string, sessionID: string, system: unknown) {
+    const sessions = getProviderSessionMap(pendingSystemByProvider, providerID)
+    const instructions = instructionsFromSystem(system)
+    if (instructions) sessions.set(sessionID, instructions)
+    else sessions.delete(sessionID)
+  }
+
+  function promotePendingSystem(providerID: string, sessionID: string) {
+    const sessions = pendingSystemByProvider.get(providerID)
+    const instructions = sessions?.get(sessionID)
+    if (!instructions) return
+    storeStableInstructions(providerID, sessionID, { instructions, inputPrefix: [] })
+    sessions?.delete(sessionID)
   }
 
   function addCheckpoint(
@@ -476,9 +548,14 @@ export function createCompactHooks(
     if (!checkpoint) return fetchInit(init, headers)
 
     headers.set("content-type", "application/json")
+    const instructionCount = leadingInstructionCount(body.input)
     const next = {
       ...body,
-      input: [...structuredClone(checkpoint.items), ...body.input],
+      input: [
+        ...body.input.slice(0, instructionCount),
+        ...structuredClone(checkpoint.items),
+        ...body.input.slice(instructionCount),
+      ],
     }
     return { ...init, headers, body: JSON.stringify(next) }
   }
@@ -509,11 +586,12 @@ export function createCompactHooks(
         : undefined
       const routedRequestInput = openAIOAuthRequestInit ? chatGPTCodexResponsesEndpoint : requestInput
       const routedRequestInit = openAIOAuthRequestInit ?? requestInit
+      const body = parseJsonRecord(typeof routedRequestInit.body === "string" ? routedRequestInit.body : undefined)
       if (!shouldCompact) {
+        rememberStableInstructions(providerID, sessionID, body)
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
-      const body = parseJsonRecord(typeof routedRequestInit.body === "string" ? routedRequestInit.body : undefined)
       if (!body?.model || !body.input || !url) {
         return baseFetch(routedRequestInput, routedRequestInit)
       }
@@ -524,7 +602,13 @@ export function createCompactHooks(
         ...routedRequestInit,
         method: "POST",
         headers: outboundCompactHeaders,
-        body: JSON.stringify(compactBody(body, provider.compactModel, config)),
+        body: JSON.stringify(
+          withStableInstructions(
+            compactBody(body, provider.compactModel, config),
+            stableInstructionsByProvider.get(providerID)?.get(sessionID),
+            config.compactBodyKeys.includes("instructions"),
+          ),
+        ),
       })
       if (!compacted.ok) {
         return compacted
@@ -567,6 +651,8 @@ export function createCompactHooks(
       for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
       pendingCompactResults.delete(sessionID)
       for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
+      for (const sessions of stableInstructionsByProvider.values()) sessions.delete(sessionID)
+      for (const sessions of pendingSystemByProvider.values()) sessions.delete(sessionID)
       for (const key of providerByMessage.keys()) {
         if (key.startsWith(`${sessionID}\0`)) providerByMessage.delete(key)
       }
@@ -627,10 +713,20 @@ export function createCompactHooks(
       if (!providerID || !configuredProviders.has(providerID)) return
       if (typeof input.sessionID !== "string") return
 
-      output.headers[config.headers.session] = input.sessionID
+      if (input.agent === "compaction") {
+        pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
+        output.headers[config.headers.session] = input.sessionID
+        output.headers[config.headers.compact] = "1"
+        return
+      }
 
-      if (input.agent !== "compaction") return
-      output.headers[config.headers.compact] = "1"
+      if (utilityAgents.has(input.agent)) {
+        pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
+        return
+      }
+
+      promotePendingSystem(providerID, input.sessionID)
+      output.headers[config.headers.session] = input.sessionID
     },
 
     "experimental.chat.messages.transform": async (input, output) => {
@@ -638,6 +734,13 @@ export function createCompactHooks(
       const providerID = transformProviderID(input, messages)
       if (!providerID || !configuredProviders.has(providerID)) return
       trimMessagesAfterCheckpoint(providerID, messages)
+    },
+
+    "experimental.chat.system.transform": async (input, output) => {
+      const providerID = getProviderID(input)
+      if (!providerID || !configuredProviders.has(providerID)) return
+      if (typeof input.sessionID !== "string") return
+      rememberPendingSystem(providerID, input.sessionID, output.system)
     },
   }
 
