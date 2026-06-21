@@ -1,12 +1,49 @@
-# opencode-openai-compact
+# OpenAI Native Compaction for OpenCode
 
 [![npm version](https://img.shields.io/npm/v/opencode-openai-compact?style=flat-square)](https://www.npmjs.com/package/opencode-openai-compact)
+[![GitHub stars](https://img.shields.io/github/stars/partment/opencode-openai-compact?style=flat-square)](https://github.com/partment/opencode-openai-compact/stargazers)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-OpenCode plugin that lets OpenCode use OpenAI's official Responses API compaction.
+Use OpenAI's official Responses API `/responses/compact` in OpenCode.
 
-## Installation
+OpenCode can compact long coding sessions. When you are using OpenAI Responses models, this plugin routes compaction through OpenAI's native compact endpoint instead of asking another model to write a text summary.
 
-Add the package to your OpenCode config.
+## Why Native Compaction
+
+| Default prompt summary | OpenAI native compaction |
+| --- | --- |
+| Generates a plain text summary | Returns an encrypted `compaction` item |
+| Can miss tool or reasoning state | Built for the Responses API state model |
+| App-owned summary format | Official `/responses/compact` output |
+| You decide what to keep | OpenAI returns the next compacted window |
+
+The important part is simple: `/responses/compact` returns compacted output that should be passed to the next `/responses` request as-is. This plugin makes OpenCode do that for OpenAI providers.
+
+## What It Does
+
+1. Intercepts OpenCode session compaction for configured OpenAI providers.
+2. Sends the current Responses input window to `/responses/compact`.
+3. Removes OpenCode's internal summary prompt from the compact request body.
+4. Stores the compacted output in a local SQLite checkpoint.
+5. Injects that checkpoint into the next `/responses` request for the same session.
+
+## When To Use It
+
+Use this if:
+
+- You use OpenAI Responses API models in OpenCode.
+- You run long coding sessions that hit compaction.
+- You want OpenAI's official compaction item instead of a custom text summary.
+
+Skip it if:
+
+- You do not use OpenAI Responses API providers.
+- You prefer OpenCode's default prompt-based summary.
+- Your sessions are short enough that compaction does not matter.
+
+## Install
+
+Add the npm package to your OpenCode config.
 
 ```jsonc
 {
@@ -24,11 +61,18 @@ For a local checkout during development, use a file URL.
 }
 ```
 
-Restart OpenCode after changing plugin config.
+Requirements:
+
+| Runtime | Version |
+| --- | --- |
+| Node.js | `>=22.12.0` |
+| OpenCode | `>=1.3.8` |
 
 ## Configuration Files
 
-Create `openai-compact.json` or `openai-compact.jsonc` in any supported location. Later layers override earlier layers. Within the same directory, `openai-compact.jsonc` is read after `openai-compact.json` and can override it.
+Most users do not need plugin-specific configuration.
+
+Create `openai-compact.json` or `openai-compact.jsonc` only when you want to override defaults. Later layers override earlier layers. Within the same directory, `openai-compact.jsonc` is read after `openai-compact.json` and can override it.
 
 Read order:
 
@@ -51,6 +95,8 @@ Runtime checkpoints are stored in SQLite at:
 ```text
 ~/.config/opencode/openai-compact/checkpoints.db
 ```
+
+The default retention is 30 days. Checkpoints are deleted when OpenCode emits `session.deleted`.
 
 ## Example Configuration
 
@@ -126,7 +172,7 @@ Runtime checkpoints are stored in SQLite at:
 | `retentionDays` | `integer` | `30` | Number of days to keep checkpoints. |
 | `deleteOnSessionDeleted` | `boolean` | `true` | Deletes checkpoints when OpenCode emits `session.deleted`. |
 
-## Star us on Github
+## Star Us On GitHub
 
 <p align="center">
   <a href="https://www.star-history.com/#partment/opencode-openai-compact&type=date&legend=bottom-right">
