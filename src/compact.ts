@@ -28,6 +28,11 @@ const wrappedFetch = "__opencodeOpenAICompactFetch"
 const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
 const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 const chatGPTCodexCompactEndpoint = "https://chatgpt.com/backend-api/codex/responses/compact"
+const openCodeCompactionDeveloperPrompt = "You are an anchored context summarization assistant for coding sessions."
+const openCodeCompactionUserPromptStarts = [
+  "Create a new anchored summary from the conversation history.",
+  "Update the anchored summary below using the conversation history above.",
+] as const
 
 function asRecord(value: unknown): AnyRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
@@ -95,6 +100,47 @@ async function bodyText(input: RequestInfo | URL, init?: RequestInit): Promise<s
   return undefined
 }
 
+function contentText(value: unknown): string {
+  if (typeof value === "string") return value
+  if (!Array.isArray(value)) return ""
+  return value
+    .map((item) => {
+      if (typeof item === "string") return item
+      const record = asRecord(item)
+      return typeof record?.text === "string" ? record.text : ""
+    })
+    .filter(Boolean)
+    .join("\n")
+}
+
+function isOpenCodeCompactionDeveloperPrompt(value: unknown) {
+  return contentText(value).trimStart().startsWith(openCodeCompactionDeveloperPrompt)
+}
+
+function isOpenCodeCompactionUserPrompt(value: unknown) {
+  const text = contentText(value).trimStart()
+  return openCodeCompactionUserPromptStarts.some((start) => text.startsWith(start))
+}
+
+function compactInput(value: unknown) {
+  if (!Array.isArray(value)) return value
+  return value.filter((item, index) => {
+    const record = asRecord(item)
+    if (!record) return true
+    if (record.role === "developer" && isOpenCodeCompactionDeveloperPrompt(record.content)) return false
+    if (index === value.length - 1 && record.role === "user" && isOpenCodeCompactionUserPrompt(record.content)) {
+      return false
+    }
+    return true
+  })
+}
+
+function compactBodyValue(key: string, value: unknown) {
+  if (key === "input") return compactInput(value)
+  if (key === "instructions" && isOpenCodeCompactionDeveloperPrompt(value)) return undefined
+  return value
+}
+
 export function compactBody(
   body: AnyRecord,
   compactModel = defaultConfig.providers.openai.compactModel,
@@ -102,7 +148,8 @@ export function compactBody(
 ): AnyRecord {
   const result: AnyRecord = { model: compactModel }
   for (const key of config.compactBodyKeys) {
-    if (body[key] !== undefined) result[key] = body[key]
+    const value = compactBodyValue(key, body[key])
+    if (value !== undefined) result[key] = value
   }
   return result
 }

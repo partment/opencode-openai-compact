@@ -36,6 +36,41 @@ describe("OpenAI compact hooks", () => {
     expect(body).toEqual({ model: defaultCompactModel, input: [] })
   })
 
+  test("builds standard compact input without OpenCode summarizer prompts", () => {
+    const body = compactBody({
+      model: "ignored",
+      instructions: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+      previous_response_id: "resp_previous",
+      input: [
+        { role: "developer", content: "Keep the user's coding preferences." },
+        {
+          role: "developer",
+          content: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+        },
+        { role: "user", content: "Create a new anchored summary from the conversation history. This is quoted." },
+        { role: "assistant", content: [{ type: "output_text", text: "quoted response" }] },
+        { role: "user", content: "real request" },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "Create a new anchored summary from the conversation history.\n\nOutput exactly..." },
+          ],
+        },
+      ],
+    })
+
+    expect(body).toEqual({
+      model: defaultCompactModel,
+      previous_response_id: "resp_previous",
+      input: [
+        { role: "developer", content: "Keep the user's coding preferences." },
+        { role: "user", content: "Create a new anchored summary from the conversation history. This is quoted." },
+        { role: "assistant", content: [{ type: "output_text", text: "quoted response" }] },
+        { role: "user", content: "real request" },
+      ],
+    })
+  })
+
   test("wraps multiple providers with their own compact models", async () => {
     const config = OpenAICompactConfigSchema.parse({
       providers: {
