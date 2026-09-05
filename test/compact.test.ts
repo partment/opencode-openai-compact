@@ -150,6 +150,7 @@ function forkHistory(sessionID: string, prefix: string, now: number) {
           type: "text",
           text: "markerless continuation",
           synthetic: true,
+          metadata: { compaction_continue: true },
         },
       ],
     },
@@ -830,7 +831,7 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
-  test("reuses a persisted checkpoint when repeated compaction omits the prior boundary", async () => {
+  test("reuses a persisted checkpoint without trusting unverified control IDs when the prior boundary is omitted", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ init?: RequestInit }> = []
     const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
@@ -904,6 +905,7 @@ describe("OpenAI compact hooks", () => {
       expect(jsonBody(calls[0]?.init).input).toEqual([
         { role: "user", content: "previous history" },
         { type: "compaction", encrypted_content: "previous" },
+        { role: "user", content: [{ type: "input_text", text: "text and metadata changed" }] },
         { role: "user", content: [{ type: "input_text", text: "retained tail" }] },
         { type: "compaction_trigger" },
       ])
@@ -2447,29 +2449,21 @@ describe("OpenAI compact hooks", () => {
       expect(boundaryMessages).toHaveLength(0)
 
       calls.length = 0
+      // No message IDs accompany these wire items. Fetch must not guess which are controls.
+      const followupInput = [
+        { role: "developer", content: "stable instructions" },
+        { role: "system", content: "more stable instructions" },
+        { role: "user", content: [{ type: "input_text", text: "retained user" }] },
+        { role: "user", content: [{ type: "input_text", text: "What did we do so far?" }] },
+        { role: "assistant", content: [{ type: "output_text", text: defaultConfig.summary }] },
+        { role: "user", content: "after compact" },
+        { role: "user", content: [{ type: "input_text", text:
+          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed." }] },
+      ]
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
         headers: { [defaultConfig.headers.session]: "ses_request" },
-        body: JSON.stringify({
-          model: "gpt",
-          input: [
-            { role: "developer", content: "stable instructions" },
-            { role: "system", content: "more stable instructions" },
-            { role: "user", content: [{ type: "input_text", text: "retained user" }] },
-            { role: "user", content: [{ type: "input_text", text: "What did we do so far?" }] },
-            { role: "assistant", content: [{ type: "output_text", text: defaultConfig.summary }] },
-            { role: "user", content: "after compact" },
-            {
-              role: "user",
-              content: [
-                {
-                  type: "input_text",
-                  text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-                },
-              ],
-            },
-          ],
-        }),
+        body: JSON.stringify({ model: "gpt", input: followupInput }),
       })
 
       const followupBody = jsonBody(calls[0]?.init)
@@ -2482,9 +2476,7 @@ describe("OpenAI compact hooks", () => {
           encrypted_content: "compacted",
           internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
         },
-        { role: "developer", content: "stable instructions" },
-        { role: "system", content: "more stable instructions" },
-        { role: "user", content: "after compact" },
+        ...followupInput,
       ])
 
       await hooks.event?.({
@@ -2510,12 +2502,12 @@ describe("OpenAI compact hooks", () => {
         { message: { id: "msg_after" }, parts: [] } as any,
       )
       const inferredProviderMessages = [
-        { info: { id: "msg_checkpoint", sessionID: "ses_request" } },
+        { info: { id: "msg_checkpoint", sessionID: "ses_request", role: "user" }, parts: [{ type: "compaction" }] },
         {
-          info: { id: "msg_continue", sessionID: "ses_request" },
+          info: { id: "msg_continue", sessionID: "ses_request", role: "user" },
           parts: [{ type: "text", synthetic: true, metadata: { compaction_continue: true } }],
         },
-        { info: { id: "msg_after", sessionID: "ses_request", role: "user" } },
+        { info: { id: "msg_after", sessionID: "ses_request", role: "user" }, parts: [{ type: "text", text: "after compact" }] },
       ]
       await hooks["experimental.chat.messages.transform"]?.({}, { messages: inferredProviderMessages } as any)
       expect(inferredProviderMessages.map((message) => message.info.id)).toEqual(["msg_after"])
@@ -2658,9 +2650,10 @@ describe("OpenAI compact hooks", () => {
             id: "msg_internal_continue", sessionID, role: "user", agent: "plan",
             model: { providerID: "openai", modelID: "gpt" }, time: { created: startedAt + 2 },
           },
-          parts: [{ type: "text", text: controlText, synthetic: true }],
+          parts: [{ type: "text", text: controlText, synthetic: true, metadata: { compaction_continue: true } }],
         },
       ]
+      const originalMessages = structuredClone(firstContinuation)
       await hooks["experimental.chat.messages.transform"]?.(
         {},
         { messages: firstContinuation } as any,
@@ -2738,7 +2731,9 @@ describe("OpenAI compact hooks", () => {
         { role: "user", content: controlText },
       ])
 
-      const restartedHooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const restartedHooks = createCompactHooks(defaultConfig, store, fakeFetch, {
+        getSessionMessages: async () => originalMessages,
+      })
       const afterRestart = [
         {
           info: { id: "msg_compaction_boundary", sessionID, role: "user", time: { created: startedAt } },
@@ -2778,7 +2773,7 @@ describe("OpenAI compact hooks", () => {
   })
 
   test.each(["marked", "markerless"])(
-    "filters %s continuation from consecutive tool requests and after restart with empty transform input",
+    "filters verified %s continuation from consecutive tool requests and after raw revalidation on restart",
     async (kind) => {
       const store = CheckpointStore.openMemory()
       const bodies: any[] = []
@@ -2811,7 +2806,7 @@ describe("OpenAI compact hooks", () => {
         parts: [
           {
             type: "text", text: controlText,
-            ...(kind === "marked" ? { synthetic: true, metadata: { compaction_continue: true } } : {}),
+            synthetic: true, metadata: { compaction_continue: true },
           },
           { type: "text", text: reminder },
         ],
@@ -2833,7 +2828,8 @@ describe("OpenAI compact hooks", () => {
       })
 
       try {
-        let hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+        const options = { getSessionMessages: async () => structuredClone([boundary, summary, continuation]) }
+        let hooks = createCompactHooks(defaultConfig, store, fakeFetch, options)
         let cfg: any = {}
         await hooks.config?.(cfg)
         const original = {
@@ -2856,11 +2852,15 @@ describe("OpenAI compact hooks", () => {
         const toolItems: any[] = []
         for (let turn = 0; turn < 4; turn++) {
           if (turn === 3) {
-            hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+            hooks = createCompactHooks(defaultConfig, store, fakeFetch, options)
             cfg = {}
             await hooks.config?.(cfg)
           }
           const messages = structuredClone([boundary, summary, continuation, ...toolHistory])
+          if (kind === "markerless" && turn > 0) {
+            delete messages[2].parts[0].synthetic
+            delete messages[2].parts[0].metadata
+          }
           await hooks["experimental.chat.messages.transform"]?.({}, { messages } as any)
           const headers = { headers: {} as Record<string, string> }
           await hooks["chat.headers"]?.(
@@ -3118,7 +3118,7 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
-  test("captures markerless auto-continue from chat headers and removes its request user item", async () => {
+  test("does not infer a markerless continuation ID or remove its request user item from chat headers", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ init?: RequestInit }> = []
     const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
@@ -3203,16 +3203,9 @@ describe("OpenAI compact hooks", () => {
         { role: "user", content: "checkpoint history" },
         { type: "compaction", encrypted_content: "checkpoint" },
         { role: "user", content: "retained tail" },
+        { role: "user", content: "markerless internal continuation" },
       ])
-      expect(store.loadControlMessages()).toEqual([
-        {
-          providerID: "openai",
-          sessionID,
-          messageID: "msg_markerless_continue",
-          createdAt: continuationCreatedAt,
-          contentText: "",
-        },
-      ])
+      expect(store.loadControlMessages()).toEqual([])
     } finally {
       store.close()
     }

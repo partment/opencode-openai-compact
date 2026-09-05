@@ -580,8 +580,11 @@ describe("session compaction lifecycle", () => {
     } finally { f.store.close() }
   })
 
-  test.each(["child-read-delete", "source-read-delete-child", "source-read-delete-source", "source-read-remove-source", "revert", "dispose", "valid"])(
-    "fork inheritance without a capture checks session generations (%s)", async (action) => {
+  test.each([
+    "child-read-delete", "source-read-delete-child", "source-read-delete-source", "source-read-remove-source",
+    "source-part-update", "child-part-update", "revert", "dispose", "valid",
+  ])(
+    "fork inheritance without a capture checks session generations and identity revisions (%s)", async (action) => {
       const store = CheckpointStore.openMemory()
       const config = OpenAICompactConfigSchema.parse({})
       const now = Date.now()
@@ -591,7 +594,7 @@ describe("session compaction lifecycle", () => {
         { info: { id: `${id}_summary`, sessionID: id, role: "assistant", summary: true, parentID: `${id}_boundary`, time: { created: now + 1 } },
           parts: [{ type: "text", text: config.summary }] },
         { info: { id: `${id}_control`, sessionID: id, role: "user", model: { providerID: "openai", modelID: "gpt" }, time: { created: now + 2 } },
-          parts: [{ type: "text", text: "markerless control", synthetic: true }] },
+          parts: [{ type: "text", text: "markerless control", synthetic: true, metadata: { compaction_continue: true } }] },
       ]
       store.upsert("parent", {
         providerID: "openai", responseID: "resp_parent", afterMessageID: "parent_boundary",
@@ -623,6 +626,12 @@ describe("session compaction lifecycle", () => {
         if (action === "source-read-remove-source") await hooks.event?.({ event: {
           type: "message.removed", properties: { sessionID: "parent", messageID: "parent_boundary" },
         } as any })
+        if (action === "source-part-update" || action === "child-part-update") {
+          const id = action === "source-part-update" ? "parent" : "child"
+          await hooks.event?.({ event: { type: "message.part.updated", properties: {
+            sessionID: id, part: { type: "text", messageID: `${id}_control`, sessionID: id, text: "now a real constraint" },
+          } } as any })
+        }
         if (action === "revert") await hooks.event?.({ event: {
           type: "session.updated", properties: { sessionID: "child", info: { id: "child", revert: { messageID: "child_boundary" } } },
         } as any })

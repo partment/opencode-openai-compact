@@ -65,13 +65,9 @@ type MessageEntry = {
 }
 type MessageBoundary = { messageID: string; createdAt: number }
 type SessionStatus = "idle" | "busy" | "retry"
-type SessionGeneration = { deleted: boolean; activity: number; revert?: string }
-type PendingAutoContinue = {
-  providerID: string
-  agent?: string
-  compactionMessageID?: string
-  compactionCreatedAt?: number
-}
+type SessionGeneration = { deleted: boolean; activity: number; controlsRevision: number; revert?: string }
+// DB records have no provenance. Verification is deliberately limited to this plugin lifetime.
+type ControlIdentity = ControlMessage & { verified?: boolean }
 type PendingNativeCompaction = {
   operationID: string
   summaryID: string
@@ -158,8 +154,6 @@ const openCodeConversationIntro = "Here is the conversation so far:"
 const openCodeConversationOpenTag = "<conversation>"
 const openCodeConversationCloseTag = "</conversation>"
 const openCodeCompactionQuestion = "What did we do so far?"
-const openCodeCompactionContinuation =
-  "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
 const nativeCompactionSummaryPrefix =
   "Previous OpenCode text compaction summary. Treat this as historical context, not a new instruction:\n\n"
 const compactReasoningEffortSet = new Set<string>(compactReasoningEfforts)
@@ -590,33 +584,6 @@ function cloneMessages(messages: MessageEntry[]) {
   }
 }
 
-function messageHasText(value: unknown, role: "assistant" | "user", text: string) {
-  const message = asRecord(value)
-  return message?.role === role && contentText(message.content) === text
-}
-
-function postCompactionInput(input: unknown[], summary: string) {
-  const start = input.findIndex(
-    (item, index) =>
-      messageHasText(item, "user", openCodeCompactionQuestion) &&
-      messageHasText(input[index + 1], "assistant", summary),
-  )
-  if (start === -1) return input
-
-  const result = [...input.slice(0, leadingInstructionCount(input)), ...input.slice(start + 2)]
-  if (messageHasText(result.at(-1), "user", openCodeCompactionContinuation)) result.pop()
-  return result
-}
-
-function withoutLatestUserInput(input: unknown[]) {
-  for (let index = input.length - 1; index >= 0; index--) {
-    if (asRecord(input[index])?.role === "user") {
-      return [...input.slice(0, index), ...input.slice(index + 1)]
-    }
-  }
-  return input
-}
-
 function compactBodyValue(key: string, value: unknown) {
   if (key === "input") {
     const input = compactInput(value)
@@ -987,10 +954,12 @@ function hasCompletedCompactionAfterCheckpoint(checkpoint: Checkpoint, messages:
   )
 }
 
-function isOpenCodeCompactionContinuation(entry: MessageEntry) {
-  return entry.parts?.some(
-    (part) => part.type === "text" && part.synthetic === true && part.metadata?.compaction_continue === true,
-  )
+function isOpenCodeCompactionContinuation(entry: MessageEntry | undefined) {
+  const info = entry?.info
+  return info?.role === "user" && typeof info.id === "string" && !!info.id &&
+    typeof info.sessionID === "string" && !!info.sessionID && Array.isArray(entry?.parts) &&
+    entry.parts.some((part) => part?.type === "text" && part.synthetic === true &&
+      part.metadata?.compaction_continue === true)
 }
 
 function selectCheckpoint(
@@ -1027,6 +996,24 @@ function sessionIDFromMessages(messages: MessageEntry[]): string | undefined {
     if (typeof sessionID === "string") return sessionID
   }
   return undefined
+}
+
+// Do not use ambiguous IDs or cross-message parts as removal or fork evidence.
+function indexSessionMessages(value: unknown, sessionID: string): Map<string, MessageEntry> | undefined {
+  if (!Array.isArray(value)) return undefined
+  const messages = new Map<string, MessageEntry>()
+  for (const item of value) {
+    const entry = asRecord(item)
+    const info = asRecord(entry?.info)
+    if (!info || info.sessionID !== sessionID || typeof info.id !== "string" || !info.id || messages.has(info.id) ||
+      !Array.isArray(entry?.parts) || entry.parts.some((value) => {
+        const part = asRecord(value)
+        return !part || (part.messageID !== undefined && part.messageID !== info.id) ||
+          (part.sessionID !== undefined && part.sessionID !== sessionID)
+      })) return undefined
+    messages.set(info.id, entry as MessageEntry)
+  }
+  return messages
 }
 
 function sortCheckpoints(checkpoints: Checkpoint[]) {
@@ -1073,15 +1060,13 @@ export function createCompactHooks(
     checkpoints.push(checkpoint)
     sessions.set(sessionID, sortCheckpoints(checkpoints))
   }
-  const controlMessagesByProvider = new Map<string, Map<string, Map<string, ControlMessage>>>()
+  const controlMessagesByProvider = new Map<string, Map<string, Map<string, ControlIdentity>>>()
   for (const control of store.loadControlMessages()) {
     const sessions = getProviderSessionMap(controlMessagesByProvider, control.providerID)
-    const messages = sessions.get(control.sessionID) ?? new Map<string, ControlMessage>()
+    const messages = sessions.get(control.sessionID) ?? new Map<string, ControlIdentity>()
     messages.set(control.messageID, control)
     sessions.set(control.sessionID, messages)
   }
-  const pendingAutoContinues = new Map<string, PendingAutoContinue>()
-  const pendingAutoContinueRequests = new Map<string, string>()
   const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
   const stableInstructionsByProvider = new Map<string, Map<string, StableInstructions>>()
   const pendingSystemByProvider = new Map<string, Map<string, string>>()
@@ -1165,10 +1150,11 @@ export function createCompactHooks(
     contentText: string,
   ) {
     const sessions = getProviderSessionMap(controlMessagesByProvider, providerID)
-    const messages = sessions.get(sessionID) ?? new Map<string, ControlMessage>()
+    const messages = sessions.get(sessionID) ?? new Map<string, ControlIdentity>()
     const existing = messages.get(messageID)
     if (existing) {
-      // Text can match genuine user input, so message IDs remain the only removal identity.
+      existing.verified = true
+      // Text is informational, never removal evidence.
       if (existing.contentText || !contentText) return
       const updated = { ...existing, contentText }
       messages.set(messageID, updated)
@@ -1176,7 +1162,8 @@ export function createCompactHooks(
       return
     }
 
-    const control: ControlMessage = {
+    const control: ControlIdentity = {
+      verified: true,
       providerID,
       sessionID,
       messageID,
@@ -1209,40 +1196,39 @@ export function createCompactHooks(
     store.deleteControlMessage(sessionID, messageID)
   }
 
-  function isPendingAutoContinueCandidate(message: MessageEntry, pending: PendingAutoContinue) {
-    const info = message.info
-    if (info?.role !== "user" || typeof info.id !== "string" || info.id === pending.compactionMessageID) return false
-    if (pending.agent && info.agent && pending.agent !== info.agent) return false
-    const createdAt = messageCreatedAt(message)
-    if (
-      createdAt !== undefined &&
-      pending.compactionCreatedAt !== undefined &&
-      createdAt < pending.compactionCreatedAt
-    ) {
-      return false
-    }
-    return message.parts?.some((part) => part.type === "text" && part.synthetic === true) === true
-  }
-
-  function captureControlMessages(providerID: string, sessionID: string, messages: MessageEntry[]) {
-    for (const message of messages) {
-      if (isOpenCodeCompactionContinuation(message)) rememberControlMessage(providerID, sessionID, message)
+  async function captureControlMessages(providerID: string, sessionID: string, messages: MessageEntry[]) {
+    const indexed = indexSessionMessages(messages, sessionID)
+    if (!indexed) return
+    for (const [id, message] of indexed) {
+      if (!isOpenCodeCompactionContinuation(message)) continue
+      const known = controlsFor(providerID, sessionID)?.get(id)
+      // Loaded or revoked IDs need raw proof, even if an old transform still has a marker.
+      if (!known || known.verified) rememberControlMessage(providerID, sessionID, message)
     }
 
-    const pending = pendingAutoContinues.get(sessionID)
-    if (pending?.providerID !== providerID) return
-    const continuation = messages.find((message) => isPendingAutoContinueCandidate(message, pending))
-    if (!continuation) return
-    rememberControlMessage(providerID, sessionID, continuation)
-    pendingAutoContinues.delete(sessionID)
+    const controls = controlsFor(providerID, sessionID)
+    const candidates = [...indexed.keys()].filter((id) => controls?.has(id) && !controls.get(id)?.verified)
+    if (!candidates.length || !options.getSessionMessages) return
+    const generation = sessionGeneration(sessionID)
+    const revision = generation.controlsRevision
+    const capture = compactionCaptures.get(sessionID)
+    const phase = capture?.phase
+    const raw = await readSessionMessages(sessionID)
+    if (!currentSession(sessionID, generation) || revision !== generation.controlsRevision ||
+      compactionCaptures.get(sessionID) !== capture || capture?.phase !== phase) return
+    const originals = indexSessionMessages(raw, sessionID)
+    for (const id of candidates) {
+      const original = originals?.get(id)
+      if (original && isOpenCodeCompactionContinuation(original)) rememberControlMessage(providerID, sessionID, original)
+    }
   }
 
   function removeControlMessages(providerID: string, sessionID: string, messages: MessageEntry[]) {
     const controls = controlsFor(providerID, sessionID)
-    if (!controls?.size) return
+    if (!controls?.size || !indexSessionMessages(messages, sessionID)) return
     const filtered = messages.filter((message) => {
-      const messageID = message.info?.id
-      return typeof messageID !== "string" || !controls.has(messageID)
+      const info = message.info
+      return info?.role !== "user" || typeof info.id !== "string" || !controls.get(info.id)?.verified
     })
     if (filtered.length !== messages.length) messages.splice(0, messages.length, ...filtered)
   }
@@ -1250,13 +1236,15 @@ export function createCompactHooks(
   // Transform history is compaction-filtered, so verify forks using raw source and child messages.
   async function inheritForkState(
     providerID: string, sessionID: string, messages: MessageEntry[], capture?: CompactionCapture,
-  ) {
+  ): Promise<boolean> {
     const getSessionMessages = options.getSessionMessages
     const capturePhase = capture?.phase
     const generation = sessionGeneration(sessionID)
-    if (!getSessionMessages || !currentSession(sessionID, generation)) return
+    const revision = generation.controlsRevision
+    if (!currentSession(sessionID, generation)) return false
+    if (!getSessionMessages) return true
     const providerSessions = checkpointsByProvider.get(providerID)
-    if (!providerSessions || providerSessions.has(sessionID)) return
+    if (!providerSessions || providerSessions.has(sessionID)) return true
 
     const boundaryTimes = new Set<number>()
     for (const message of messages) {
@@ -1264,13 +1252,15 @@ export function createCompactHooks(
       if (createdAt === undefined || !message.parts?.some((part) => part.type === "compaction")) continue
       boundaryTimes.add(createdAt)
     }
-    if (!boundaryTimes.size) return
+    if (!boundaryTimes.size) return true
 
     const childValue = await readSessionMessages(sessionID)
-    if (!Array.isArray(childValue) || !currentSession(sessionID, generation) || compactionCaptures.get(sessionID) !== capture ||
-      capture?.phase !== capturePhase) return
+    if (!currentSession(sessionID, generation) || revision !== generation.controlsRevision ||
+      compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return false
+    if (!Array.isArray(childValue) || !indexSessionMessages(childValue, sessionID)) return true
     const childMessages = childValue as MessageEntry[]
     const childFingerprints = childMessages.map(forkMessageFingerprint)
+    let staleSource = false
     const candidates = (
       await Promise.all(
         [...providerSessions.entries()].map(async ([sourceSessionID, checkpoints]) => {
@@ -1279,10 +1269,16 @@ export function createCompactHooks(
           }
 
           const sourceGeneration = sessionGeneration(sourceSessionID)
+          const sourceRevision = sourceGeneration.controlsRevision
           if (!currentSession(sourceSessionID, sourceGeneration)) return undefined
           const value = await readSessionMessages(sourceSessionID)
-          if (!Array.isArray(value) || !currentSession(sourceSessionID, sourceGeneration) ||
-            providerSessions.get(sourceSessionID) !== checkpoints) return undefined
+          const sourceIndex = indexSessionMessages(value, sourceSessionID)
+          if (!currentSession(sourceSessionID, sourceGeneration) || sourceRevision !== sourceGeneration.controlsRevision ||
+            providerSessions.get(sourceSessionID) !== checkpoints) {
+            staleSource = true
+            return undefined
+          }
+          if (!Array.isArray(value) || !sourceIndex) return undefined
           const sourceMessages = value as MessageEntry[]
           const limit = Math.min(sourceMessages.length, childMessages.length)
           let prefixLength = 0
@@ -1308,6 +1304,8 @@ export function createCompactHooks(
           return {
             sourceSessionID,
             sourceGeneration,
+            sourceRevision,
+            sourceIndex,
             checkpoints,
             prefixLength,
             messageIDs,
@@ -1319,15 +1317,18 @@ export function createCompactHooks(
           }
         }),
       )
-    ).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined &&
-      currentSession(candidate.sourceSessionID, candidate.sourceGeneration) &&
-      providerSessions.get(candidate.sourceSessionID) === candidate.checkpoints)
-    if (!candidates.length || providerSessions.has(sessionID) || !currentSession(sessionID, generation) || compactionCaptures.get(sessionID) !== capture ||
-      capture?.phase !== capturePhase) return
+    ).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined)
+    // Stale ancestry also invalidates subsequent control publication by this transform.
+    if (staleSource || candidates.some((candidate) => !currentSession(candidate.sourceSessionID, candidate.sourceGeneration) ||
+      candidate.sourceRevision !== candidate.sourceGeneration.controlsRevision ||
+      providerSessions.get(candidate.sourceSessionID) !== candidate.checkpoints) ||
+      !currentSession(sessionID, generation) || revision !== generation.controlsRevision ||
+      compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return false
+    if (!candidates.length || providerSessions.has(sessionID)) return true
 
     const prefixLength = Math.max(...candidates.map((candidate) => candidate.prefixLength))
     const finalists = candidates.filter((candidate) => candidate.prefixLength === prefixLength)
-    if (new Set(finalists.map((candidate) => candidate.signature)).size !== 1) return
+    if (new Set(finalists.map((candidate) => candidate.signature)).size !== 1) return true
 
     const selected = finalists[0]
     const inherited = selected.inherited.map((checkpoint) => ({
@@ -1342,6 +1343,7 @@ export function createCompactHooks(
     const conflictingControls = new Set<string>()
     for (const candidate of finalists) {
       for (const control of controlsFor(providerID, candidate.sourceSessionID)?.values() ?? []) {
+        if (!control.verified && !isOpenCodeCompactionContinuation(candidate.sourceIndex.get(control.messageID))) continue
         const messageID = candidate.messageIDs.get(control.messageID)
         if (!messageID || conflictingControls.has(messageID)) continue
         const next = { ...control, sessionID, messageID }
@@ -1366,6 +1368,7 @@ export function createCompactHooks(
         control.contentText,
       )
     }
+    return true
   }
 
   function storeStableInstructions(providerID: string, sessionID: string, stable: StableInstructions) {
@@ -1440,20 +1443,13 @@ export function createCompactHooks(
     const index = messages.findIndex((message) => message.info?.id === checkpoint.afterMessageID)
     if (index === -1) return
 
-    let start = index + 1
+    if (!indexSessionMessages(messages, sessionID)) return
     const boundary = messages[index]
-    if (boundary?.info?.role === "user" && boundary.parts?.some((part) => part.type === "compaction")) {
-      const summaryIndex = messages.findIndex(
-        (message, messageIndex) =>
-          messageIndex > index &&
-          message.info?.role === "assistant" &&
-          message.info.summary === true &&
-          message.info.parentID === boundary.info?.id,
-      )
-      if (summaryIndex !== -1) start = summaryIndex + 1
-    }
-
-    const trimmed = messages.slice(start).filter((message) => !isOpenCodeCompactionContinuation(message))
+    const compactionBoundary = boundary.info?.role === "user" && boundary.parts?.some((part) => part.type === "compaction")
+    // Only the prefix through the boundary is covered by the checkpoint. A summary
+    // later in the history does not authorize dropping intervening genuine messages.
+    const trimmed = messages.slice(index + 1).filter((message) => !(compactionBoundary &&
+      message.info?.role === "assistant" && message.info.summary === true && message.info.parentID === boundary.info?.id))
     messages.splice(0, messages.length, ...trimmed)
   }
 
@@ -1466,7 +1462,7 @@ export function createCompactHooks(
 
   function sessionGeneration(sessionID: string) {
     let generation = sessionGenerations.get(sessionID)
-    if (!generation) sessionGenerations.set(sessionID, generation = { deleted: false, activity: 0 })
+    if (!generation) sessionGenerations.set(sessionID, generation = { deleted: false, activity: 0, controlsRevision: 0 })
     return generation
   }
 
@@ -1501,14 +1497,12 @@ export function createCompactHooks(
 
   function invalidateSession(sessionID: string, deleted = false) {
     const previous = sessionGeneration(sessionID)
-    const generation = { deleted: deleted || previous.deleted, activity: 0, revert: previous.revert }
+    const generation = { deleted: deleted || previous.deleted, activity: 0, controlsRevision: 0, revert: previous.revert }
     sessionGenerations.set(sessionID, generation)
     invalidateCompactOperations(sessionID)
     clearStructuredCapture(sessionID)
     compactionOwners.delete(sessionID)
     pendingNativeCompactions.delete(sessionID)
-    pendingAutoContinues.delete(sessionID)
-    pendingAutoContinueRequests.delete(sessionID)
     return generation
   }
 
@@ -1658,7 +1652,6 @@ export function createCompactHooks(
     init: RequestInit | undefined,
     headers: Headers,
     sessionID: string,
-    removeLatestUser: boolean,
     selectedCheckpoint?: Checkpoint,
   ): Promise<RequestInit> {
     const checkpoint = selectedCheckpoint ?? activeCheckpointByProvider.get(providerID)?.get(sessionID)
@@ -1670,11 +1663,9 @@ export function createCompactHooks(
     if (!checkpoint) return fetchInitForReroute(requestInput, init, headers)
 
     headers.set("content-type", "application/json")
-    const postCompaction = postCompactionInput(body.input, config.summary)
-    const input = removeLatestUser ? withoutLatestUserInput(postCompaction) : postCompaction
     const next = {
       ...body,
-      input: [...structuredClone(checkpoint.items), ...input],
+      input: [...structuredClone(checkpoint.items), ...body.input],
     }
     return { ...fetchInitForReroute(requestInput, init, headers), body: JSON.stringify(next) }
   }
@@ -1690,7 +1681,7 @@ export function createCompactHooks(
     let body = parseJsonRecord(originalBody)
     const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
     if (body && Array.isArray(body.input) && checkpoint) {
-      body = { ...body, input: [...structuredClone(checkpoint.items), ...postCompactionInput(body.input, config.summary)] }
+      body = { ...body, input: [...structuredClone(checkpoint.items), ...body.input] }
     }
     const target = usesOpenAIOAuth(providerID, headers) ? chatGPTCodexResponsesEndpoint : url.href
     if (!body || typeof body.model !== "string" || !Array.isArray(body.input)) {
@@ -1921,9 +1912,6 @@ export function createCompactHooks(
         return fetchCompactOperation(providerID, provider, sessionID, operationID, requestInput, init, outboundHeaders, baseFetch)
       }
 
-      const removeLatestUser =
-        sessionID !== undefined && pendingAutoContinueRequests.get(sessionID) === providerID
-      if (removeLatestUser) pendingAutoContinueRequests.delete(sessionID)
       const nativeCompaction = sessionID ? pendingNativeCompactions.get(sessionID) : undefined
       const matchingNativeCompaction = nativeCompaction?.providerID === providerID ? nativeCompaction : undefined
       if (shouldNativeCompact && (operationID !== matchingNativeCompaction?.operationID ||
@@ -1944,7 +1932,6 @@ export function createCompactHooks(
               init,
               outboundHeaders,
               sessionID,
-              removeLatestUser,
               shouldNativeCompact ? matchingNativeCompaction?.checkpoint : undefined,
             )
           : originalRequestInit
@@ -2042,7 +2029,18 @@ export function createCompactHooks(
       return
     }
 
-    if (event.type === "message.updated") {
+    if (event.type === "message.updated" || event.type === "message.part.updated" || event.type === "message.part.removed") {
+      // A pending raw read must not restore proof revoked by a later message edit.
+      sessionGeneration(sessionID).controlsRevision++
+      const messageID = event.type === "message.updated" ? asRecord(properties?.info)?.id :
+        event.type === "message.part.updated" ? asRecord(properties?.part)?.messageID : properties?.messageID
+      if (typeof messageID === "string") {
+        for (const sessions of controlMessagesByProvider.values()) {
+          const control = sessions.get(sessionID)?.get(messageID)
+          if (control) control.verified = false
+        }
+      }
+      if (event.type !== "message.updated") return
       const capture = compactionCaptures.get(sessionID)
       if (capture?.binding) finishCapture(capture, properties?.info)
       else if (capture && terminalCaptureSummary(capture, properties?.info)) await refreshCompactionOwner(sessionID)
@@ -2125,8 +2123,6 @@ export function createCompactHooks(
       for (const map of [checkpointsByProvider, activeCheckpointByProvider, controlMessagesByProvider,
         stableInstructionsByProvider, pendingSystemByProvider]) map.clear()
       pendingNativeCompactions.clear()
-      pendingAutoContinues.clear()
-      pendingAutoContinueRequests.clear()
       providerByMessage.clear()
       store.close()
     },
@@ -2227,34 +2223,6 @@ export function createCompactHooks(
       }
       if (!configuredProviders.has(providerID)) return
 
-      const pendingAutoContinue = pendingAutoContinues.get(input.sessionID)
-      if (pendingAutoContinue?.providerID === providerID) {
-        const message = asRecord(input.message)
-        const messageID = message?.id
-        const createdAt = asRecord(message?.time)?.created
-        const createdAfterCompaction =
-          !finiteNumber(createdAt) ||
-          pendingAutoContinue.compactionCreatedAt === undefined ||
-          createdAt >= pendingAutoContinue.compactionCreatedAt
-        const matchingAgent = !pendingAutoContinue.agent || pendingAutoContinue.agent === input.agent
-        if (
-          createdAfterCompaction &&
-          matchingAgent &&
-          typeof messageID === "string" &&
-          messageID !== pendingAutoContinue.compactionMessageID
-        ) {
-          rememberControlIdentity(
-            providerID,
-            input.sessionID,
-            messageID,
-            finiteNumber(createdAt) ? createdAt : Date.now(),
-            "",
-          )
-          pendingAutoContinueRequests.set(input.sessionID, providerID)
-          pendingAutoContinues.delete(input.sessionID)
-        }
-      }
-
       const messageAgent = asRecord(input.message)?.agent
       if (
         (typeof messageAgent === "string" && messageAgent !== input.agent) ||
@@ -2285,15 +2253,22 @@ export function createCompactHooks(
       }
       const capturing = capture?.phase === "pending" && currentCapture(capture)
       const capturePhase = capture?.phase
+      const revision = generation.controlsRevision
       const providerID = providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
       if (providerID && configuredProviders.has(providerID)) {
-        await inheritForkState(providerID, sessionID, messages, capture)
-        if (!currentSession(sessionID, generation) || compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return
+        if (!(await inheritForkState(providerID, sessionID, messages, capture))) return
+        if (!currentSession(sessionID, generation) || revision !== generation.controlsRevision ||
+          compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return
         if (capturing && !activeCheckpointByProvider.get(providerID)?.has(sessionID)) {
           const checkpoint = checkpointsByProvider.get(providerID)?.get(sessionID)?.at(-1)
           if (checkpoint) getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
         }
-        captureControlMessages(providerID, sessionID, messages)
+        await captureControlMessages(providerID, sessionID, messages)
+        if (!currentSession(sessionID, generation) || revision !== generation.controlsRevision ||
+          compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return
+        // Select/trim before removal can erase the last session-bearing control message.
+        // An unbound compaction still needs OpenCode's native, untrimmed history.
+        if (!capturing) trimMessagesAfterCheckpoint(providerID, messages)
         removeControlMessages(providerID, sessionID, messages)
         const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
         if (capturing && capture.boundary && checkpoint && capture.rawMessages &&
@@ -2311,8 +2286,6 @@ export function createCompactHooks(
         capture.rawMessages = undefined
         capture.phase = "ready"
       }
-      // An unbound compaction must retain OpenCode's native history, not a plugin-trimmed prompt.
-      if (providerID && configuredProviders.has(providerID) && !capturing) trimMessagesAfterCheckpoint(providerID, messages)
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -2358,32 +2331,13 @@ export function createCompactHooks(
       if (typeof input.sessionID !== "string" || disposed) return
       if (sessionGeneration(input.sessionID).deleted) return
       const capture = compactionCaptures.get(input.sessionID)
-      if (capture) {
-        if (!currentCapture(capture) || !matchesCaptureMessage(capture, input.message)) return
-        // This hook's provider is the continuation provider, not necessarily the compaction provider.
-        releaseCapture(capture, capture.phase === "pending" || capture.phase === "ready" ? "ignored" : capture.phase)
-        // Native compaction on an unsupported target must not arm continuation filtering
-        // for a configured source provider's next ordinary request.
-        if (capture.phase === "ignored") {
-          if (compactionOwners.get(input.sessionID) === capture.id) compactionOwners.delete(input.sessionID)
-          return
-        }
+      if (!capture || !currentCapture(capture) || !matchesCaptureMessage(capture, input.message)) return
+      // The callback identifies the compaction parent, not the next user or its provider.
+      // Continuation identity is established only from message parts in transform.
+      releaseCapture(capture, capture.phase === "pending" || capture.phase === "ready" ? "ignored" : capture.phase)
+      if (capture.phase === "ignored" && compactionOwners.get(input.sessionID) === capture.id) {
+        compactionOwners.delete(input.sessionID)
       }
-      // Legacy responses have no verifiable OpenCode parent. Their late callbacks must
-      // neither move a boundary nor arm filtering for a later, genuine user request.
-      if (!capture && [...compactOperationsByProvider.values()].some((sessions) => sessions.has(input.sessionID))) return
-      const providerID = getProviderID(input)
-      if (!providerID || !configuredProviders.has(providerID)) return
-      const message = asRecord(input.message)
-      const messageID = message?.id
-      const createdAt = asRecord(message?.time)?.created
-      pendingAutoContinueRequests.delete(input.sessionID)
-      pendingAutoContinues.set(input.sessionID, {
-        providerID,
-        agent: typeof input.agent === "string" ? input.agent : undefined,
-        compactionMessageID: typeof messageID === "string" ? messageID : undefined,
-        compactionCreatedAt: finiteNumber(createdAt) ? createdAt : undefined,
-      })
     },
   }
 
