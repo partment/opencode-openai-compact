@@ -1,13 +1,13 @@
-import type { Hooks } from "@opencode-ai/plugin"
 import { describe, expect, test, vi } from "vitest"
 import { createCompactHooks } from "../src/compact.js"
 import { openAIOAuthDummyKey } from "../src/oauth.js"
 import { OpenAICompactConfigSchema } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
+import { compactionFixture } from "./compaction-fixture.js"
 
 const operationHeader = "x-opencode-openai-compact-operation"
 const url = "https://proxy.test/v1/responses"
-const model = { providerID: "openai", modelID: "gpt-conversation", variant: "xhigh" }
+const model = { providerID: "openai", id: "gpt-conversation", modelID: "gpt-conversation", variant: "xhigh" }
 const embedded = "Here is the conversation so far:\n<conversation>\n[User]: flattened history\n</conversation>"
 
 function completed(id = "resp_retry") {
@@ -25,19 +25,9 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-async function capture(hooks: Hooks, sessionID: string, boundary: any, history: any[]) {
-  await hooks["experimental.session.compacting"]?.({ sessionID }, { context: [] })
-  await hooks["experimental.chat.messages.transform"]?.({}, { messages: history.slice() } as any)
-  const output = { headers: {} as Record<string, string> }
-  await hooks["chat.headers"]?.(
-    { sessionID, agent: "compaction", model, message: boundary } as any, output,
-  )
-  return output.headers
-}
-
 async function retrySession(
   fakeFetch: typeof fetch,
-  options: { legacy?: boolean; attachments?: boolean; invalid?: "clone" | "convert"; capture?: boolean } = {},
+  options: { unbound?: boolean; attachments?: boolean; invalid?: "clone" | "convert"; capture?: boolean } = {},
 ) {
   const config = OpenAICompactConfigSchema.parse({ providers: { openai: {}, other: {} } })
   const store = CheckpointStore.openMemory()
@@ -81,7 +71,8 @@ async function retrySession(
   ]
   if (options.invalid === "clone") (history[0].parts[0] as any).metadata = { uncloneable: () => undefined }
   if (options.invalid === "convert") (history[1].parts[1] as any).state.output = undefined
-  const hooks = createCompactHooks(config, store, fakeFetch)
+  const fixture = compactionFixture()
+  const hooks = createCompactHooks(config, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
   const cfg: any = {}
   try {
     await hooks.config?.(cfg)
@@ -93,11 +84,13 @@ async function retrySession(
     )
     let headers: Record<string, string> = { [config.headers.session]: sessionID, [config.headers.compact]: "1" }
     if (options.capture !== false) {
-      if (options.legacy) {
+      if (options.unbound) {
+        const prepared = await fixture.prepare({ sessionID, boundary, history, model })
         await hooks["experimental.session.compacting"]?.({ sessionID }, { context: [] })
-        await hooks["experimental.chat.messages.transform"]?.({}, { messages: history.slice() } as any)
+        await hooks["experimental.chat.messages.transform"]?.({}, { messages: prepared.history } as any)
+        fixture.addSummary(prepared)
       } else {
-        headers = await capture(hooks, sessionID, boundary, history)
+        headers = await fixture.capture(hooks, { sessionID, boundary, history, model })
       }
     }
     const init: RequestInit = {
@@ -109,7 +102,7 @@ async function retrySession(
         tools: [{ type: "function", name: "read", parameters: { type: "object" } }],
       }),
     }
-    return { config, store, hooks, cfg, sessionID, boundary, history, oldItems, init, fetch: cfg.provider.openai.options.fetch as typeof fetch }
+    return { config, store, hooks, cfg, fixture, sessionID, boundary, history, oldItems, init, fetch: cfg.provider.openai.options.fetch as typeof fetch }
   } catch (error) {
     store.close()
     throw error
@@ -117,12 +110,12 @@ async function retrySession(
 }
 
 describe("immutable compaction retries", () => {
-  test.each([false, true])("replays frozen input after 429 despite changed session state (legacy: %s)", async (legacy) => {
+  test("replays frozen input after 429 despite changed session state", async () => {
     const sent: RequestInit[] = []
     const f = await retrySession((async (_input, init) => {
       sent.push(init!)
       return sent.length === 1 ? new Response("rate limited", { status: 429, headers: { "retry-after": "12" } }) : completed()
-    }) as typeof fetch, { legacy })
+    }) as typeof fetch)
     try {
       const first = await f.fetch(url, f.init)
       expect(first.status).toBe(429)
@@ -166,10 +159,8 @@ describe("immutable compaction retries", () => {
         expect(outbound.has(f.config.headers.compact)).toBe(false)
       }
       const checkpoint = f.store.loadAll().find((row) => row.checkpoint.responseID === "resp_retry")!.checkpoint
-      if (!legacy) {
-        expect(checkpoint.afterMessageID).toBe(f.boundary.id)
-        expect(checkpoint.afterCreatedAt).toBe(f.boundary.time.created)
-      }
+      expect(checkpoint.afterMessageID).toBe(f.boundary.id)
+      expect(checkpoint.afterCreatedAt).toBe(f.boundary.time.created)
       const replay = await f.fetch(url, f.init)
       expect(await replay.text()).toBe(await second.text())
       expect(sent).toHaveLength(2)
@@ -338,9 +329,9 @@ describe("immutable compaction retries", () => {
         if (event === "deleted") await f.hooks.event?.({ event: {
           type: "session.deleted", properties: { sessionID: f.sessionID },
         } as any })
-        if (event === "new-compaction") nextHeaders = await capture(
-          f.hooks, f.sessionID, { ...f.boundary, id: "msg_new_boundary" }, f.history,
-        )
+        if (event === "new-compaction") nextHeaders = await f.fixture.capture(f.hooks, {
+          sessionID: f.sessionID, boundary: { ...f.boundary, id: "msg_new_boundary" }, history: f.history, model,
+        })
         if (event === "dispose") { await f.hooks.dispose?.(); closed = true }
         gate.resolve(completed())
         expect((await pending).status).toBe(400)
@@ -452,20 +443,23 @@ describe("immutable compaction retries", () => {
       const gate = deferred<unknown>()
       let reads = 0
       const hooks = createCompactHooks(f.config, f.store, network, {
-        async getSessionMessages() {
+        async getSessionMessages(sessionID) {
           if (++reads === 1) { started.resolve(); return gate.promise }
-          return []
+          return f.fixture.getSessionMessages(sessionID)
         },
       })
       const cfg: any = {}
       await hooks.config?.(cfg)
-      await hooks["experimental.session.compacting"]?.({ sessionID: f.sessionID }, { context: [] })
-      const first = hooks["experimental.chat.messages.transform"]?.({}, { messages: structuredClone(f.history) } as any)
+      await f.fixture.prepare({ sessionID: f.sessionID, boundary: f.boundary, history: f.history, model })
+      const oldRaw = f.fixture.sessions.get(f.sessionID)
+      const first = hooks["experimental.session.compacting"]?.({ sessionID: f.sessionID }, { context: [] })
       await started.promise
       const newer = structuredClone(f.history)
       newer[0].parts[0].text = "new capture"
-      const headers = await capture(hooks, f.sessionID, { ...f.boundary, id: "msg_new_capture" }, newer)
-      gate.resolve([])
+      const headers = await f.fixture.capture(hooks, {
+        sessionID: f.sessionID, boundary: { ...f.boundary, id: "msg_new_capture" }, history: newer, model,
+      })
+      gate.resolve(oldRaw)
       await first
       expect((await cfg.provider.openai.options.fetch(url, { ...f.init, headers })).status).toBe(200)
       expect(sent).toHaveLength(1)
@@ -477,13 +471,18 @@ describe("immutable compaction retries", () => {
 
   test("an empty operation ID cannot consume an unclaimed snapshot", async () => {
     const network = vi.fn(async () => completed())
-    const f = await retrySession(network as typeof fetch, { legacy: true })
+    const f = await retrySession(network as typeof fetch, { unbound: true })
     try {
       const headers = new Headers(f.init.headers)
       headers.set(operationHeader, "")
       expect((await f.fetch(url, { ...f.init, headers })).status).toBe(400)
+      expect((await f.fetch(url, f.init)).status).toBe(400)
       expect(network).not.toHaveBeenCalled()
-      expect((await f.fetch(url, f.init)).status).toBe(200)
+      const output = { headers: {} as Record<string, string> }
+      await f.hooks["chat.headers"]?.(
+        { sessionID: f.sessionID, agent: "compaction", model, message: f.boundary } as any, output,
+      )
+      expect((await f.fetch(url, { ...f.init, headers: output.headers })).status).toBe(200)
       expect(network).toHaveBeenCalledTimes(1)
     } finally { f.store.close() }
   })

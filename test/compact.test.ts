@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest"
 import { compactBody, compactedItemsFrom, createCompactHooks } from "../src/compact.js"
 import { defaultConfig, OpenAICompactConfigSchema } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
+import { compactionFixture } from "./compaction-fixture.js"
 
 function jsonBody(init: RequestInit | undefined) {
   return JSON.parse(typeof init?.body === "string" ? init.body : "{}")
@@ -43,24 +44,27 @@ async function attachmentRequest(
     })
   }) as typeof fetch
   try {
-    const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+    const fixture = compactionFixture()
+    const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
     const cfg: any = {}
     await hooks.config?.(cfg)
     const sessionID = "ses_attachments"
-    await hooks["experimental.session.compacting"]?.({ sessionID } as any, { context: [], prompt: undefined })
-    await hooks["experimental.chat.messages.transform"]?.({}, { messages: [
-      { info: { id: "msg_user", sessionID, role: "user" }, parts: files.length
-        ? files.map((file) => ({ type: "file", ...file }))
-        : [{ type: "text", text: "request" }] },
-      { info: { id: "msg_assistant", sessionID, role: "assistant", providerID: "openai", modelID: currentModel },
-        parts: [{ type: "tool", tool: "read", callID: "call_attachment", state: {
-          status: "completed", input: {}, output: text, attachments: files,
-          time: { start: 1, end: 2, ...(cleared ? { compacted: 3 } : {}) },
-        } }] },
-    ] } as any)
+    const attachmentHeaders = await fixture.capture(hooks, {
+      sessionID,
+      history: [
+        { info: { id: "msg_user", sessionID, role: "user" }, parts: files.length
+          ? files.map((file) => ({ type: "file", ...file }))
+          : [{ type: "text", text: "request" }] },
+        { info: { id: "msg_assistant", sessionID, role: "assistant", providerID: "openai", modelID: currentModel },
+          parts: [{ type: "tool", tool: "read", callID: "call_attachment", state: {
+            status: "completed", input: {}, output: text, attachments: files,
+            time: { start: 1, end: 2, ...(cleared ? { compacted: 3 } : {}) },
+          } }] },
+      ],
+    })
     const response = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
       method: "POST",
-      headers: { [defaultConfig.headers.compact]: "1", [defaultConfig.headers.session]: sessionID },
+      headers: attachmentHeaders,
       body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "compact" }] }),
     })
     return { bodies, response, checkpoints: store.loadAll() }
@@ -439,73 +443,65 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
       const sessionID = "ses_structured"
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_user", sessionID, role: "user" },
-              parts: [
-                { type: "text", text: "fix compact request" },
-                { type: "file", mime: "image/png", filename: "request.png", url: "data:image/png;base64,AA==" },
-              ],
+      const structuredHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_user", sessionID, role: "user" },
+            parts: [
+              { type: "text", text: "fix compact request" },
+              { type: "file", mime: "image/png", filename: "request.png", url: "data:image/png;base64,AA==" },
+            ],
+          },
+          {
+            info: {
+              id: "msg_assistant",
+              sessionID,
+              role: "assistant",
+              providerID: "openai",
+              modelID: currentModel,
+              error: { name: "MessageAbortedError", data: { message: "Aborted" } },
             },
-            {
-              info: {
-                id: "msg_assistant",
-                sessionID,
-                role: "assistant",
-                providerID: "openai",
-                modelID: currentModel,
-                error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+            parts: [
+              {
+                type: "reasoning",
+                text: "Inspected the request.",
+                metadata: {
+                  openai: { itemId: "rs_structured", reasoningEncryptedContent: "encrypted-reasoning" },
+                },
               },
-              parts: [
-                {
-                  type: "reasoning",
-                  text: "Inspected the request.",
-                  metadata: {
-                    openai: { itemId: "rs_structured", reasoningEncryptedContent: "encrypted-reasoning" },
-                  },
+              {
+                type: "text",
+                text: "The request loses history.",
+                metadata: { openai: { itemId: "msg_structured", phase: "final_answer" } },
+              },
+              {
+                type: "tool",
+                tool: "read_file",
+                callID: "call_structured",
+                state: {
+                  status: "completed",
+                  input: { path: "src/compact.ts" },
+                  output: "file contents",
+                  time: { start: 1, end: 2 },
                 },
-                {
-                  type: "text",
-                  text: "The request loses history.",
-                  metadata: { openai: { itemId: "msg_structured", phase: "final_answer" } },
-                },
-                {
-                  type: "tool",
-                  tool: "read_file",
-                  callID: "call_structured",
-                  state: {
-                    status: "completed",
-                    input: { path: "src/compact.ts" },
-                    output: "file contents",
-                    time: { start: 1, end: 2 },
-                  },
-                },
-              ],
-            },
-          ],
-        } as any,
-      )
+              },
+            ],
+          },
+        ],
+      })
 
       const embedded = "Unrecognized future compaction format with flattened history that must not be sent"
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: sessionID,
-        },
+        headers: structuredHeaders,
         body: JSON.stringify({
           model: currentModel,
           instructions: "Unrecognized future compaction agent instructions.",
@@ -687,50 +683,42 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const sessionID = "ses_follow_conversation"
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_old",
-                sessionID,
-                role: "assistant",
-                providerID: "openai",
-                modelID: "gpt-old",
-                variant: "low",
-              },
-              parts: [{ type: "text", text: "old response" }],
+      const conversationHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: {
+              id: "msg_old",
+              sessionID,
+              role: "assistant",
+              providerID: "openai",
+              modelID: "gpt-old",
+              variant: "low",
             },
-            {
-              info: {
-                id: "msg_latest",
-                sessionID,
-                role: "user",
-                model: { providerID: "openai", modelID: "gpt-latest", variant: "xhigh" },
-              },
-              parts: [{ type: "text", text: "latest request" }],
+            parts: [{ type: "text", text: "old response" }],
+          },
+          {
+            info: {
+              id: "msg_latest",
+              sessionID,
+              role: "user",
+              model: { providerID: "openai", modelID: "gpt-latest", variant: "xhigh" },
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "text", text: "latest request" }],
+          },
+        ],
+      })
 
       const embedded = "Unrecognized future compaction format with flattened history"
       await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: sessionID,
-        },
+        headers: conversationHeaders,
         body: JSON.stringify({
           model: "compaction-agent-model",
           instructions: "Unrecognized future compaction agent instructions.",
@@ -761,7 +749,8 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
@@ -796,21 +785,15 @@ describe("OpenAI compact hooks", () => {
         }),
       })
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_tail", sessionID, role: "user", model: { providerID: "openai", modelID: "ignored" } },
-              parts: [{ type: "text", text: "structured tail" }],
-            },
-          ],
-        } as any,
-      )
+      const checkpointHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_tail", sessionID, role: "user", model: { providerID: "openai", modelID: "ignored" } },
+            parts: [{ type: "text", text: "structured tail" }],
+          },
+        ],
+      })
 
       const embedded = [
         "Create a new anchored summary from the conversation history.",
@@ -819,10 +802,7 @@ describe("OpenAI compact hooks", () => {
       ].join("\n\n")
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: sessionID,
-        },
+        headers: checkpointHeaders,
         body: JSON.stringify({
           model: "ignored",
           instructions: "You are an anchored context summarization assistant for coding sessions.",
@@ -883,44 +863,34 @@ describe("OpenAI compact hooks", () => {
     })
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_old_continue", sessionID, role: "user", time: { created: now + 1 } },
-              parts: [{ type: "text", text: "text and metadata changed" }],
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_old_continue", sessionID, role: "user", time: { created: now + 1 } },
+            parts: [{ type: "text", text: "text and metadata changed" }],
+          },
+          {
+            info: {
+              id: "msg_tail",
+              sessionID,
+              role: "user",
+              model: { providerID: "openai", modelID: "gpt" },
+              time: { created: now + 2 },
             },
-            {
-              info: {
-                id: "msg_tail",
-                sessionID,
-                role: "user",
-                model: { providerID: "openai", modelID: "gpt" },
-                time: { created: now + 2 },
-              },
-              parts: [{ type: "text", text: "retained tail" }],
-            },
-          ],
-        } as any,
-      )
+            parts: [{ type: "text", text: "retained tail" }],
+          },
+        ],
+        boundary: { id: "msg_new_compaction", time: { created: now + 3 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "another-internal-name",
+      })
       const headers = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "another-internal-name",
-          model: { providerID: "openai" },
-          message: { id: "msg_new_compaction", time: { created: now + 3 }, agent: "build" },
-        } as any,
-        headers,
-      )
+      Object.assign(headers.headers, capturedHeaders)
       await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
         headers: headers.headers,
@@ -955,27 +925,22 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
       const sessionID = "ses_structured_fallback"
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_uncloneable", sessionID, role: "user" },
-              parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
-            },
-          ],
-        } as any,
-      )
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_uncloneable", sessionID, role: "user" },
+            parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
+          },
+        ],
+      })
 
       const embedded = [
         "Here is the conversation so far:",
@@ -989,10 +954,7 @@ describe("OpenAI compact hooks", () => {
       ].join("\n\n")
       const request = {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: sessionID,
-        },
+        headers: capturedHeaders,
         body: JSON.stringify({
           model: "ignored",
           instructions:
@@ -1022,34 +984,24 @@ describe("OpenAI compact hooks", () => {
     const sessionID = "ses_failed_transaction_capture"
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_uncloneable", sessionID, role: "user", model: { providerID: "openai", modelID: "gpt" } },
-              parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
-            },
-          ],
-        } as any,
-      )
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_uncloneable", sessionID, role: "user", model: { providerID: "openai", modelID: "gpt" } },
+            parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
+          },
+        ],
+        boundary: { id: "msg_compaction", time: { created: Date.now() }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "changed-compaction-agent",
+      })
       const headers = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "changed-compaction-agent",
-          model: { providerID: "openai" },
-          message: { id: "msg_compaction", time: { created: Date.now() }, agent: "build" },
-        } as any,
-        headers,
-      )
+      Object.assign(headers.headers, capturedHeaders)
       const response = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
         headers: headers.headers,
@@ -1103,7 +1055,8 @@ describe("OpenAI compact hooks", () => {
     })
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
 
@@ -1114,53 +1067,43 @@ describe("OpenAI compact hooks", () => {
       })
       expect(jsonBody(calls[0]?.init).input).toEqual([{ role: "user", content: "before checkpoint check" }])
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_invalid_checkpoint", sessionID, role: "user", time: { created: now } },
-              parts: [{ type: "compaction" }],
+      const nativeCaptureHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_invalid_checkpoint", sessionID, role: "user", time: { created: now } },
+            parts: [{ type: "compaction" }],
+          },
+          {
+            info: {
+              id: "msg_invalid_summary",
+              sessionID,
+              role: "assistant",
+              parentID: "msg_invalid_checkpoint",
+              summary: true,
+              finish: "stop",
+              time: { created: now + 1, completed: now + 2 },
             },
-            {
-              info: {
-                id: "msg_invalid_summary",
-                sessionID,
-                role: "assistant",
-                parentID: "msg_invalid_checkpoint",
-                summary: true,
-                finish: "stop",
-                time: { created: now + 1, completed: now + 2 },
-              },
-              parts: [{ type: "text", text: defaultConfig.summary }],
+            parts: [{ type: "text", text: defaultConfig.summary }],
+          },
+          {
+            info: {
+              id: "msg_native_tail",
+              sessionID,
+              role: "user",
+              model: { providerID: "openai", modelID: currentModel },
+              time: { created: now + 2 },
             },
-            {
-              info: {
-                id: "msg_native_tail",
-                sessionID,
-                role: "user",
-                model: { providerID: "openai", modelID: currentModel },
-                time: { created: now + 2 },
-              },
-              parts: [{ type: "text", text: "tail for native summary" }],
-            },
-          ],
-        } as any,
-      )
+            parts: [{ type: "text", text: "tail for native summary" }],
+          },
+        ],
+        boundary: { id: "msg_native_compaction", time: { created: now + 3 }, agent: "build" },
+        summaryID: "msg_native_summary",
+        model: { providerID: "openai" },
+        agent: "renamed-compaction-agent",
+      })
       const nativeHeaders = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "renamed-compaction-agent",
-          model: { providerID: "openai" },
-          message: { id: "msg_native_compaction", time: { created: now + 3 }, agent: "build" },
-        } as any,
-        nativeHeaders,
-      )
+      Object.assign(nativeHeaders.headers, nativeCaptureHeaders)
       expect(nativeHeaders.headers[defaultConfig.headers.compact]).toBe("native")
 
       const nativeBody = {
@@ -1229,37 +1172,26 @@ describe("OpenAI compact hooks", () => {
       })
       expect(jsonBody(calls[3]?.init).input).toEqual([{ role: "user", content: "after native compaction" }])
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_healthy_history",
-                sessionID,
-                role: "user",
-                model: { providerID: "openai", modelID: currentModel },
-                time: { created: now + 4 },
-              },
-              parts: [{ type: "text", text: "healthy history" }],
+      const pluginCaptureHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: {
+              id: "msg_healthy_history",
+              sessionID,
+              role: "user",
+              model: { providerID: "openai", modelID: currentModel },
+              time: { created: now + 4 },
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "text", text: "healthy history" }],
+          },
+        ],
+        boundary: { id: "msg_plugin_compaction", time: { created: now + 5 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "renamed-compaction-agent",
+      })
       const pluginHeaders = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "renamed-compaction-agent",
-          model: { providerID: "openai" },
-          message: { id: "msg_plugin_compaction", time: { created: now + 5 }, agent: "build" },
-        } as any,
-        pluginHeaders,
-      )
+      Object.assign(pluginHeaders.headers, pluginCaptureHeaders)
       expect(pluginHeaders.headers[defaultConfig.headers.compact]).toBe("1")
 
       await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
@@ -1351,38 +1283,23 @@ describe("OpenAI compact hooks", () => {
     })
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, {
-        async getSessionMessages() {
-          return rawMessages
-        },
-      })
+      const fixture = compactionFixture(async () => rawMessages)
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          // OpenCode removes completed compaction pairs before this transform.
-          messages: [firstTail],
-        } as any,
-      )
+      const firstCaptureHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [firstTail],
+        boundary: { id: "msg_recovered_plugin_compaction", time: { created: now + 14 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "compaction",
+      })
 
       expect(store.count()).toBe(0)
       expect(store.loadControlMessages()).toEqual([])
 
       const headers = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "compaction",
-          model: { providerID: "openai" },
-          message: { id: "msg_recovered_plugin_compaction", time: { created: now + 14 }, agent: "build" },
-        } as any,
-        headers,
-      )
+      Object.assign(headers.headers, firstCaptureHeaders)
       expect(headers.headers[defaultConfig.headers.compact]).toBe("1")
 
       await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
@@ -1451,24 +1368,15 @@ describe("OpenAI compact hooks", () => {
         },
         secondTail,
       ]
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        { messages: [secondTail] } as any,
-      )
+      const secondCaptureHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [secondTail],
+        boundary: { id: "msg_second_plugin_compaction", time: { created: now + 17 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "compaction",
+      })
       const secondHeaders = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "compaction",
-          model: { providerID: "openai" },
-          message: { id: "msg_second_plugin_compaction", time: { created: now + 17 }, agent: "build" },
-        } as any,
-        secondHeaders,
-      )
+      Object.assign(secondHeaders.headers, secondCaptureHeaders)
       await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: secondHeaders.headers,
@@ -1521,37 +1429,27 @@ describe("OpenAI compact hooks", () => {
     })
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_failed_native", sessionID, role: "user",
-                model: { providerID: "openai", modelID: currentModel }, time: { created: now },
-              },
-              parts: [{ type: "compaction" }],
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: {
+              id: "msg_failed_native", sessionID, role: "user",
+              model: { providerID: "openai", modelID: currentModel }, time: { created: now },
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "compaction" }],
+          },
+        ],
+        boundary: { id: "msg_retry_failure", time: { created: now + 1 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "compaction",
+      })
       const headers = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "compaction",
-          model: { providerID: "openai" },
-          message: { id: "msg_retry_failure", time: { created: now + 1 }, agent: "build" },
-        } as any,
-        headers,
-      )
+      Object.assign(headers.headers, capturedHeaders)
       const response = await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: headers.headers,
@@ -1602,35 +1500,25 @@ describe("OpenAI compact hooks", () => {
     })
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store)
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_invalid_checkpoint", sessionID, role: "user",
-                model: { providerID: "openai", modelID: currentModel }, time: { created: now },
-              },
-              parts: [{ type: "compaction" }],
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, undefined, { getSessionMessages: fixture.getSessionMessages })
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: {
+              id: "msg_invalid_checkpoint", sessionID, role: "user",
+              model: { providerID: "openai", modelID: currentModel }, time: { created: now },
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "compaction" }],
+          },
+        ],
+        boundary: { id: "msg_native_attempt", time: { created: now + 1 } },
+        model: { providerID: "openai" },
+        agent: "compaction",
+      })
       const headers = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "compaction",
-          model: { providerID: "openai" },
-          message: { id: "msg_native_attempt", time: { created: now + 1 } },
-        } as any,
-        headers,
-      )
+      Object.assign(headers.headers, capturedHeaders)
       expect(headers.headers[defaultConfig.headers.compact]).toBe("native")
 
       await hooks.event?.({
@@ -1688,40 +1576,30 @@ describe("OpenAI compact hooks", () => {
     })
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_invalid_checkpoint",
-                sessionID,
-                role: "user",
-                model: { providerID: "openai", modelID: currentModel },
-                time: { created: now + 10 },
-              },
-              parts: [{ type: "compaction" }],
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: {
+              id: "msg_invalid_checkpoint",
+              sessionID,
+              role: "user",
+              model: { providerID: "openai", modelID: currentModel },
+              time: { created: now + 10 },
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "compaction" }],
+          },
+        ],
+        boundary: { id: "msg_native_attempt", time: { created: now + 11 } },
+        model: { providerID: "openai" },
+        agent: "compaction",
+      })
       const headers = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID,
-          agent: "compaction",
-          model: { providerID: "openai" },
-          message: { id: "msg_native_attempt", time: { created: now + 11 } },
-        } as any,
-        headers,
-      )
+      Object.assign(headers.headers, capturedHeaders)
       expect(headers.headers[defaultConfig.headers.compact]).toBe("native")
 
       await hooks.event?.({
@@ -2116,25 +1994,20 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const sessionID = "ses_unknown_compaction"
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: { id: "msg_uncloneable_unknown", sessionID, role: "user" },
-              parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
-            },
-          ],
-        } as any,
-      )
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID,
+        history: [
+          {
+            info: { id: "msg_uncloneable_unknown", sessionID, role: "user" },
+            parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
+          },
+        ],
+      })
       const body = {
         model: currentModel,
         instructions: "Unknown future summarizer instructions.",
@@ -2142,10 +2015,7 @@ describe("OpenAI compact hooks", () => {
       }
       const response = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: sessionID,
-        },
+        headers: capturedHeaders,
         body: JSON.stringify(body),
       })
 
@@ -2167,14 +2037,11 @@ describe("OpenAI compact hooks", () => {
       )
       const second = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: sessionID,
-        },
+        headers: capturedHeaders,
         body: JSON.stringify(body),
       })
-      expect(second.status).toBe(502)
-      expect(await second.text()).toContain("could not be captured safely")
+      expect(second.status).toBe(400)
+      expect(await second.text()).toContain("no longer valid")
       expect(calls).toEqual([])
       expect(store.count()).toBe(0)
     } finally {
@@ -2307,7 +2174,8 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
@@ -2351,46 +2219,35 @@ describe("OpenAI compact hooks", () => {
         { sessionID: "ses_rendered", model: { providerID: "openai" } } as any,
         { system: ["You are an anchored context summarization assistant for coding sessions.\n\nSummarize only..."] },
       )
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID: "ses_rendered" } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_rendered_user",
-                sessionID: "ses_rendered",
-                role: "user",
-                model: { providerID: "openai", modelID: "gpt" },
-              },
-              parts: [{ type: "text", text: "hello" }],
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID: "ses_rendered",
+        history: [
+          {
+            info: {
+              id: "msg_rendered_user",
+              sessionID: "ses_rendered",
+              role: "user",
+              model: { providerID: "openai", modelID: "gpt" },
             },
-            {
-              info: {
-                id: "msg_rendered_assistant",
-                sessionID: "ses_rendered",
-                role: "assistant",
-                providerID: "openai",
-                modelID: "gpt",
-              },
-              parts: [{ type: "text", text: "done" }],
+            parts: [{ type: "text", text: "hello" }],
+          },
+          {
+            info: {
+              id: "msg_rendered_assistant",
+              sessionID: "ses_rendered",
+              role: "assistant",
+              providerID: "openai",
+              modelID: "gpt",
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "text", text: "done" }],
+          },
+        ],
+        boundary: { id: "msg_compaction", time: { created: 3 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "renamed-internal-agent",
+      })
       const compactHeaders = { headers: {} as Record<string, string> }
-      await hooks["chat.headers"]?.(
-        {
-          sessionID: "ses_rendered",
-          agent: "renamed-internal-agent",
-          model: { providerID: "openai" },
-          message: { id: "msg_compaction", time: { created: 3 }, agent: "build" },
-        } as any,
-        compactHeaders,
-      )
+      Object.assign(compactHeaders.headers, capturedHeaders)
 
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
@@ -3584,39 +3441,29 @@ describe("OpenAI compact hooks", () => {
   test("adds compaction headers from the captured transaction without relying on the agent name", async () => {
     const store = CheckpointStore.openMemory()
     try {
-      const hooks = createCompactHooks(defaultConfig, store)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, undefined, { getSessionMessages: fixture.getSessionMessages })
       const output = { headers: {} as Record<string, string> }
 
-      await hooks["experimental.session.compacting"]?.(
-        { sessionID: "ses" } as any,
-        { context: [], prompt: undefined },
-      )
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        {
-          messages: [
-            {
-              info: {
-                id: "msg_user",
-                sessionID: "ses",
-                role: "user",
-                model: { providerID: "openai", modelID: "gpt" },
-              },
-              parts: [{ type: "text", text: "history" }],
+      const capturedHeaders = await fixture.capture(hooks, {
+        sessionID: "ses",
+        history: [
+          {
+            info: {
+              id: "msg_user",
+              sessionID: "ses",
+              role: "user",
+              model: { providerID: "openai", modelID: "gpt" },
             },
-          ],
-        } as any,
-      )
+            parts: [{ type: "text", text: "history" }],
+          },
+        ],
+        boundary: { id: "msg_compaction", time: { created: 2 }, agent: "build" },
+        model: { providerID: "openai" },
+        agent: "renamed-internal-agent",
+      })
 
-      await hooks["chat.headers"]?.(
-        {
-          model: { providerID: "openai" },
-          sessionID: "ses",
-          agent: "renamed-internal-agent",
-          message: { id: "msg_compaction", time: { created: 2 }, agent: "build" },
-        } as any,
-        output,
-      )
+      Object.assign(output.headers, capturedHeaders)
 
       expect(output.headers[defaultConfig.headers.session]).toBe("ses")
       expect(output.headers[defaultConfig.headers.compact]).toBe("1")
