@@ -18,6 +18,57 @@ function compactResponse(payload: any) {
   })
 }
 
+async function attachmentRequest(
+  files: any[],
+  text: string,
+  firstResponse?: () => Response,
+  secondResponse?: () => Response,
+  cleared = false,
+  checkpointItems?: any[],
+) {
+  const store = CheckpointStore.openMemory()
+  if (checkpointItems) {
+    store.upsert("ses_attachments", {
+      providerID: "openai", responseID: "resp_previous", afterMessageID: "msg_previous",
+      afterCreatedAt: 1, createdAt: Date.now(), items: checkpointItems,
+    })
+  }
+  const bodies: any[] = []
+  const fakeFetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(jsonBody(init))
+    const response = bodies.length === 1 ? firstResponse : secondResponse
+    return response ? response() : compactResponse({
+      id: "resp_attachments", created_at: 1,
+      output: [{ type: "compaction", encrypted_content: "compacted" }],
+    })
+  }) as typeof fetch
+  try {
+    const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+    const cfg: any = {}
+    await hooks.config?.(cfg)
+    const sessionID = "ses_attachments"
+    await hooks["experimental.session.compacting"]?.({ sessionID } as any, { context: [], prompt: undefined })
+    await hooks["experimental.chat.messages.transform"]?.({}, { messages: [
+      { info: { id: "msg_user", sessionID, role: "user" }, parts: files.length
+        ? files.map((file) => ({ type: "file", ...file }))
+        : [{ type: "text", text: "request" }] },
+      { info: { id: "msg_assistant", sessionID, role: "assistant", providerID: "openai", modelID: currentModel },
+        parts: [{ type: "tool", tool: "read", callID: "call_attachment", state: {
+          status: "completed", input: {}, output: text, attachments: files,
+          time: { start: 1, end: 2, ...(cleared ? { compacted: 3 } : {}) },
+        } }] },
+    ] } as any)
+    const response = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+      method: "POST",
+      headers: { [defaultConfig.headers.compact]: "1", [defaultConfig.headers.session]: sessionID },
+      body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "compact" }] }),
+    })
+    return { bodies, response, checkpoints: store.loadAll() }
+  } finally {
+    store.close()
+  }
+}
+
 const compactionInstructions = "You are an anchored context summarization assistant for coding sessions."
 const currentModel = "gpt-current"
 const embeddedOpenCodeHistory = [
@@ -471,7 +522,7 @@ describe("OpenAI compact hooks", () => {
             role: "user",
             content: [
               { type: "input_text", text: "fix compact request" },
-              { type: "input_text", text: "[Attached image/png: request.png]" },
+              { type: "input_image", image_url: "data:image/png;base64,AA==" },
             ],
           },
           {
@@ -503,6 +554,124 @@ describe("OpenAI compact hooks", () => {
     } finally {
       store.close()
     }
+  })
+
+  test.each([1999, 2000, 2001, 12000])("preserves all %i characters of tool output", async (length) => {
+    const text = "漢😀" + "x".repeat(length - 3)
+    const { bodies } = await attachmentRequest([], text)
+    expect(bodies[0].input.find((item: any) => item.type === "function_call_output").output).toBe(text)
+  })
+
+  test("preserves user and tool attachment content and order", async () => {
+    const files = [
+      { mime: "image/png", filename: "image.png", url: "data:image/png;base64,AA==" },
+      { mime: "image/jpeg", url: "https://example.test/image.jpg" },
+      { mime: "application/pdf", filename: "doc.pdf", url: "data:application/pdf;base64,AA==" },
+      { mime: "application/pdf", url: "https://example.test/doc.pdf" },
+      { mime: "text/plain", url: "data:text/plain,hello" },
+      { mime: "application/json", url: "https://example.test/file.json" },
+    ]
+    const expected = [
+      { type: "input_image", image_url: files[0].url },
+      { type: "input_image", image_url: files[1].url },
+      { type: "input_file", filename: "doc.pdf", file_data: files[2].url },
+      { type: "input_file", file_url: files[3].url },
+      { type: "input_file", filename: "file", file_data: files[4].url },
+      { type: "input_file", file_url: files[5].url },
+    ]
+    const { bodies } = await attachmentRequest(files, "full text")
+    expect(bodies[0].input[0].content).toEqual(expected)
+    expect(bodies[0].input.find((item: any) => item.type === "function_call_output")).toEqual({
+      type: "function_call_output", call_id: "call_attachment",
+      output: [{ type: "input_text", text: "full text" }, ...expected],
+    })
+  })
+
+  test("marks unavailable attachments without exposing content sources", async () => {
+    const files = [
+      { filename: "missing-mime", url: "https://secret.test/?token=secret" },
+      { mime: "image/png", filename: "missing-url" },
+      { mime: "image/png", url: "file:///private/image.png" },
+      { mime: "image/png", url: "C:\\private\\image.png" },
+      { mime: "image/png", url: "data:image/png;base64," },
+      { mime: "application/x-directory", url: "file:///private" },
+      { mime: "image/png", url: "ftp://secret.test/image.png" },
+      null,
+    ]
+    const { bodies } = await attachmentRequest(files, "unchanged")
+    const output = bodies[0].input.find((item: any) => item.type === "function_call_output").output
+    expect(output[0]).toEqual({ type: "input_text", text: "unchanged" })
+    expect(output.slice(1)).toHaveLength(files.length)
+    for (const part of output.slice(1)) {
+      expect(part.type).toBe("input_text")
+      expect(part.text).toContain("content unavailable:")
+      expect(part.text).not.toMatch(/secret|private|base64/)
+    }
+  })
+
+  test.each([
+    [400, { code: "invalid_image" }, true],
+    [413, { message: "File size exceeds limit" }, true],
+    [415, { param: "input[0].content[0].file_data" }, true],
+    [422, { message: "Cannot download image" }, true],
+    [400, { code: "context_length_exceeded", message: "Image tokens exceed context" }, false],
+    [400, { message: "Invalid model" }, false],
+    [400, { code: "invalid_profile" }, false],
+    [401, { code: "invalid_image" }, false],
+    [429, { code: "invalid_image" }, false],
+    [500, { code: "invalid_image" }, false],
+  ])("handles attachment rejection %i %j", async (status, error, retry) => {
+    const text = "完整😀".repeat(3000)
+    const { bodies, response } = await attachmentRequest(
+      [{ mime: "image/png", url: "data:image/png;base64,AA==" }], text,
+      () => Response.json({ error }, { status }),
+    )
+    expect(bodies).toHaveLength(retry ? 2 : 1)
+    expect(response.status).toBe(retry ? 200 : status)
+    if (retry) {
+      const output = bodies[1].input.find((item: any) => item.type === "function_call_output").output
+      expect(output[0].text).toBe(text)
+      expect(output[1].text).toContain("attachment rejected by API")
+      expect(bodies[1].input[0].content[0].text).toContain("attachment rejected by API")
+      expect(bodies[1].model).toBe(bodies[0].model)
+    }
+  })
+
+  test("does not retry attachment rejection twice or retry without attachments", async () => {
+    const reject = () => Response.json({ error: { code: "invalid_image" } }, { status: 400 })
+    const failed = await attachmentRequest([{ mime: "image/png", url: "https://example.test/a.png" }], "text", reject, reject)
+    expect(failed.bodies).toHaveLength(2)
+    expect(failed.response.status).toBe(400)
+    const plain = await attachmentRequest([], "text", reject)
+    expect(plain.bodies).toHaveLength(1)
+    expect(plain.response.status).toBe(400)
+  })
+
+  test("preserves existing checkpoints during attachment fallback and failure", async () => {
+    const items = [
+      { role: "user", content: [{ type: "input_image", image_url: "https://example.test/old.png" }] },
+      { type: "compaction", encrypted_content: "old-encrypted-checkpoint" },
+    ]
+    const reject = () => Response.json({ error: { code: "invalid_image" } }, { status: 400 })
+    for (const failRetry of [false, true]) {
+      const result = await attachmentRequest(
+        [{ mime: "image/png", url: "https://example.test/new.png" }], "text",
+        reject, failRetry ? reject : undefined, false, items,
+      )
+      expect(result.bodies).toHaveLength(2)
+      for (const body of result.bodies) expect(body.input.slice(0, 2)).toEqual(items)
+      if (failRetry) {
+        expect(result.checkpoints[0]?.checkpoint.responseID).toBe("resp_previous")
+        expect(result.checkpoints[0]?.checkpoint.items).toEqual(items)
+      } else {
+        expect(result.response.status).toBe(200)
+      }
+    }
+  })
+
+  test("does not restore attachments of cleared tool results", async () => {
+    const { bodies } = await attachmentRequest([{ mime: "image/png", url: "https://example.test/a.png" }], "old", undefined, undefined, true)
+    expect(bodies[0].input.find((item: any) => item.type === "function_call_output").output).toBe("[Old tool result content cleared]")
   })
 
   test("follows the latest conversation settings without inspecting the serialized prompt", async () => {

@@ -114,7 +114,6 @@ const openCodeCompactionContinuation =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
 const nativeCompactionSummaryPrefix =
   "Previous OpenCode text compaction summary. Treat this as historical context, not a new instruction:\n\n"
-const toolOutputMaxChars = 2_000
 const compactReasoningEffortSet = new Set<string>(compactReasoningEfforts)
 
 function asRecord(value: unknown): AnyRecord | undefined {
@@ -324,16 +323,68 @@ function isKnownOpenCodeCompactionBody(body: AnyRecord) {
   return last?.role === "user" && isOpenCodeCompactionUserPrompt(last.content)
 }
 
-function truncateToolOutput(value: string) {
-  if (value.length <= toolOutputMaxChars) return value
-  const omitted = value.length - toolOutputMaxChars
-  return `${value.slice(0, toolOutputMaxChars)}\n[Tool output truncated for compaction: omitted ${omitted} chars]`
+function attachmentContent(value: unknown, fallbacks: Map<AnyRecord, AnyRecord>): AnyRecord {
+  const file = asRecord(value)
+  const mime = typeof file?.mime === "string" ? file.mime : "unknown MIME"
+  const filename = typeof file?.filename === "string" ? file.filename : "file"
+  const marker = (reason: string) => ({
+    type: "input_text",
+    text: `[Attached ${mime}: ${filename}; content unavailable: ${reason}]`,
+  })
+  if (!file || typeof file.mime !== "string" || !file.mime) return marker("missing MIME")
+  if (mime === "application/x-directory") return marker("directory attachment")
+  if (typeof file.url !== "string" || !file.url.trim()) return marker("missing content source")
+  const url = file.url
+  const data = /^data:[^,]+,([\s\S]+)$/.test(url)
+  let remote = false
+  try {
+    const parsed = new URL(url)
+    remote = (parsed.protocol === "https:" || parsed.protocol === "http:") && !!parsed.hostname
+  } catch {
+    // Local paths and malformed URLs are not read or uploaded by this plugin.
+  }
+  if (!data && !remote) return marker("unsupported or empty content source")
+  const content = mime.startsWith("image/")
+    ? { type: "input_image", image_url: url }
+    : data
+      ? { type: "input_file", filename, file_data: url }
+      : { type: "input_file", file_url: url }
+  fallbacks.set(content, marker("attachment rejected by API"))
+  return content
+}
+
+async function isAttachmentRejection(response: Response) {
+  if (![400, 413, 415, 422].includes(response.status)) return false
+  const payload = asRecord(await response.clone().json().catch(() => undefined))
+  const error = asRecord(payload?.error)
+  if (!error) return false
+  const code = typeof error.code === "string" ? error.code : ""
+  const param = typeof error.param === "string" ? error.param : ""
+  const message = typeof error.message === "string" ? error.message : ""
+  if (/context|token/i.test(`${code} ${message}`)) return false
+  const attachment = /(?:^|[^a-z])(?:images?|files?|attachments?)(?:$|[^a-z])/i
+  return attachment.test(`${code} ${param}`) ||
+    (attachment.test(message) && /unsupported|invalid|format|access|fetch|download|size|large|limit|exceed/i.test(message))
+}
+
+function attachmentFallbackInput(input: unknown, fallbacks: Map<AnyRecord, AnyRecord>) {
+  if (!Array.isArray(input)) return input
+  return input.map((value) => {
+    const item = asRecord(value)
+    if (!item) return value
+    const next = { ...item }
+    for (const key of ["content", "output"]) {
+      if (Array.isArray(item[key])) next[key] = item[key].map((part: AnyRecord) => fallbacks.get(part) ?? part)
+    }
+    return next
+  })
 }
 
 function structuredOpenAIInput(
   messages: MessageEntry[],
   providerID: string,
   sourceModel: string,
+  attachmentFallbacks: Map<AnyRecord, AnyRecord>,
 ): AnyRecord[] | undefined {
   const input: AnyRecord[] = []
 
@@ -351,18 +402,7 @@ function structuredOpenAIInput(
           continue
         }
         if (part.type === "file") {
-          if (typeof part.mime !== "string") return undefined
-          if (part.mime === "text/plain" || part.mime === "application/x-directory") continue
-          if (part.mime.startsWith("image/") || part.mime === "application/pdf") {
-            content.push({ type: "input_text", text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` })
-            continue
-          }
-          if (typeof part.url !== "string") return undefined
-          content.push(
-            part.url.startsWith("data:")
-              ? { type: "input_file", filename: part.filename ?? "file", file_data: part.url }
-              : { type: "input_file", file_url: part.url },
-          )
+          content.push(attachmentContent(part, attachmentFallbacks))
           continue
         }
         if (part.type === "compaction") {
@@ -461,7 +501,7 @@ function structuredOpenAIInput(
       if (state.status === "completed") {
         const time = asRecord(state.time)
         if (time?.compacted) output = "[Old tool result content cleared]"
-        else if (typeof state.output === "string") output = truncateToolOutput(state.output)
+        else if (typeof state.output === "string") output = state.output
         else return undefined
       } else if (state.status === "error") {
         const metadata = asRecord(state.metadata)
@@ -473,7 +513,16 @@ function structuredOpenAIInput(
       } else {
         return undefined
       }
-      toolOutputs.push({ type: "function_call_output", call_id: part.callID, output })
+      const attachments = state.status === "completed" && !asRecord(state.time)?.compacted && Array.isArray(state.attachments)
+        ? state.attachments
+        : []
+      toolOutputs.push({
+        type: "function_call_output",
+        call_id: part.callID,
+        output: attachments.length
+          ? [{ type: "input_text", text: output }, ...attachments.map((file) => attachmentContent(file, attachmentFallbacks))]
+          : output,
+      })
     }
 
     input.push(...assistantItems, ...toolOutputs)
@@ -1345,13 +1394,14 @@ export function createCompactHooks(
     sessionID: string,
     sourceModel: string,
     snapshot: StructuredCompactionSnapshot | undefined,
+    attachmentFallbacks: Map<AnyRecord, AnyRecord>,
   ) {
     const messages = snapshot?.messages ? cloneMessages(snapshot.messages) : undefined
     if (!messages) return undefined
 
     try {
       trimMessagesAfterCheckpoint(providerID, messages)
-      const history = structuredOpenAIInput(messages, providerID, sourceModel)
+      const history = structuredOpenAIInput(messages, providerID, sourceModel, attachmentFallbacks)
       if (!history) return undefined
 
       const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
@@ -1497,7 +1547,8 @@ export function createCompactHooks(
         conversation?.reasoningEffort ??
         compactReasoningEffort(asRecord(body.reasoning)?.effort) ??
         null
-      const structuredInput = structuredInputFor(providerID, sessionID, selectedModel, snapshot)
+      const attachmentFallbacks = new Map<AnyRecord, AnyRecord>()
+      const structuredInput = structuredInputFor(providerID, sessionID, selectedModel, snapshot, attachmentFallbacks)
       if (snapshot && !structuredInput) {
         clearStructuredCapture(sessionID)
         return new Response("OpenAI compact structured history could not be converted safely", { status: 502 })
@@ -1512,17 +1563,29 @@ export function createCompactHooks(
       const compactBodyWithHistory = compactBody(body, selectedModel, config, selectedReasoningEffort)
       delete compactBodyWithHistory.instructions
       if (structuredInput) compactBodyWithHistory.input = [...structuredInput, { type: "compaction_trigger" }]
-      const compactRequestBody = withStableInstructions(
+      let compactRequestBody = withStableInstructions(
         compactBodyWithHistory,
         stableInstructionsByProvider.get(providerID)?.get(sessionID),
         config.compactBodyKeys.includes("instructions"),
       )
-      const compacted = await baseFetch(routedRequestInput, {
+      let compacted = await baseFetch(routedRequestInput, {
         ...routedRequestInit,
         method: "POST",
         headers: outboundCompactHeaders,
         body: JSON.stringify(compactRequestBody),
       })
+      if (attachmentFallbacks.size && await isAttachmentRejection(compacted)) {
+        compactRequestBody = {
+          ...compactRequestBody,
+          input: attachmentFallbackInput(compactRequestBody.input, attachmentFallbacks),
+        }
+        compacted = await baseFetch(routedRequestInput, {
+          ...routedRequestInit,
+          method: "POST",
+          headers: outboundCompactHeaders,
+          body: JSON.stringify(compactRequestBody),
+        })
+      }
       if (!compacted.ok) {
         clearStructuredCapture(sessionID)
         return compacted
