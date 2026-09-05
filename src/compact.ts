@@ -1010,7 +1010,7 @@ export function createCompactHooks(
 
   function rememberMessageProvider(input: unknown, output: unknown) {
     const providerID = getProviderID(input)
-    if (!providerID || !configuredProviders.has(providerID)) return
+    if (!providerID) return
 
     const inputRecord = asRecord(input)
     const sessionID = inputRecord?.sessionID
@@ -1025,12 +1025,15 @@ export function createCompactHooks(
   }
 
   function providerIDFromMessages(messages: MessageEntry[]) {
-    for (const message of messages) {
-      const sessionID = (message.info as AnyRecord | undefined)?.sessionID
-      const messageID = message.info?.id
-      if (typeof sessionID !== "string" || typeof messageID !== "string") continue
-      const providerID = providerByMessage.get(messageProviderKey(sessionID, messageID))
-      if (providerID) return providerID
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const info = messages[index].info
+      if (info?.role !== "user") continue
+      if (typeof info.model?.providerID === "string") return info.model.providerID
+
+      // Only the latest user identifies this turn; older users may belong to another provider.
+      return typeof info.sessionID === "string" && typeof info.id === "string"
+        ? providerByMessage.get(messageProviderKey(info.sessionID, info.id))
+        : undefined
     }
     return undefined
   }
@@ -1053,10 +1056,6 @@ export function createCompactHooks(
       result = providerID
     }
     return result
-  }
-
-  function transformProviderID(input: unknown, messages: MessageEntry[]) {
-    return getProviderID(input) ?? providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
   }
 
   function controlsFor(providerID: string, sessionID: string) {
@@ -1869,11 +1868,11 @@ export function createCompactHooks(
       output.headers[config.headers.session] = input.sessionID
     },
 
-    "experimental.chat.messages.transform": async (input, output) => {
+    "experimental.chat.messages.transform": async (_input, output) => {
       const messages = output.messages as unknown as MessageEntry[]
       const sessionID = sessionIDFromMessages(messages)
       const pendingCaptures = sessionID ? pendingCompactionCaptures.get(sessionID) : undefined
-      const providerID = transformProviderID(input, messages)
+      const providerID = providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
       let rawMessages: MessageEntry[] | undefined
       if (sessionID && providerID && configuredProviders.has(providerID)) {
         await inheritForkState(providerID, sessionID, messages)
