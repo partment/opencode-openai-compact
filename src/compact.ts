@@ -1,4 +1,5 @@
 import type { Hooks } from "@opencode-ai/plugin"
+import { createHash, randomUUID } from "node:crypto"
 import {
   compactReasoningEfforts,
   defaultConfig,
@@ -85,6 +86,31 @@ type StructuredCompactionSnapshot = {
   conversation?: ConversationSettings
   nativeSummary?: string
 }
+type PreparedCompactRequest = {
+  body: string
+  fallbackBody?: string
+  target: string
+  model: string
+  summary: string
+  passthrough: boolean
+}
+type CompactOperation = {
+  id: string
+  requiresID: boolean
+  providerID: string
+  sessionID: string
+  createdAt: number
+  boundary?: MessageBoundary
+  agent?: string
+  snapshot?: StructuredCompactionSnapshot
+  fingerprint?: string
+  prepared?: PreparedCompactRequest
+  failure?: string
+  invalidated?: boolean
+  inFlight?: Promise<Response>
+  completed?: boolean
+  result?: Response
+}
 type ProviderConfig = OpenAICompactConfig["providers"][string]
 type StableInstructions = { instructions?: unknown; inputPrefix: unknown[] }
 type CompactHookOptions = {
@@ -95,6 +121,7 @@ type CompactHookOptions = {
 
 const wrappedFetch = "__opencodeOpenAICompactFetch"
 const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
+const compactOperationHeader = "x-opencode-openai-compact-operation"
 const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 const openCodeCompactionDeveloperPromptStarts = [
   "You are an anchored context summarization assistant for coding sessions.",
@@ -177,6 +204,7 @@ function cleanedHeaders(headers: Headers, config: OpenAICompactConfig): Headers 
   const result = new Headers(headers)
   result.delete(config.headers.compact)
   result.delete(config.headers.session)
+  result.delete(compactOperationHeader)
   return result
 }
 
@@ -221,7 +249,9 @@ function compactMarkers(headers: Headers, config: OpenAICompactConfig) {
 
 async function bodyText(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
   if (typeof init?.body === "string") return init.body
-  if (init?.body instanceof Uint8Array) return new TextDecoder().decode(init.body)
+  if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) return new TextDecoder().decode(init.body)
+  // An unsupported override must not silently fall back to the Request's different original body.
+  if (init?.body != null) return undefined
   if (input instanceof Request) return input.clone().text()
   return undefined
 }
@@ -985,18 +1015,18 @@ export function createCompactHooks(
     sessions.set(control.sessionID, messages)
   }
   const pendingCompactResults = new Map<string, PendingCompactResult>()
-  const pendingCompactionBoundaries = new Map<string, MessageBoundary>()
   const pendingAutoContinues = new Map<string, PendingAutoContinue>()
   const pendingAutoContinueRequests = new Map<string, string>()
   const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
   const stableInstructionsByProvider = new Map<string, Map<string, StableInstructions>>()
   const pendingSystemByProvider = new Map<string, Map<string, string>>()
   const providerByMessage = new Map<string, string>()
-  const pendingCompactionCaptures = new Map<string, number>()
+  const pendingCompactionCaptures = new Map<string, symbol>()
   const failedCompactionCaptures = new Set<string>()
-  const blockedCompactionRequests = new Set<string>()
-  const structuredCompactionSnapshots = new Map<string, StructuredCompactionSnapshot[]>()
+  const structuredCompactionSnapshots = new Map<string, StructuredCompactionSnapshot>()
+  const compactOperationsByProvider = new Map<string, Map<string, CompactOperation>>()
   const pendingNativeCompactions = new Map<string, PendingNativeCompaction>()
+  let disposed = false
   let openAIAuth: OpenAIOAuthAuth | undefined
   let openAIWrappedFetch: FetchLike | undefined
   const openAIOAuth = createOpenAIOAuth({
@@ -1362,29 +1392,59 @@ export function createCompactHooks(
     messages.splice(0, messages.length, ...trimmed)
   }
 
-  function takeStructuredSnapshot(sessionID: string) {
-    const snapshots = structuredCompactionSnapshots.get(sessionID)
-    const snapshot = snapshots?.shift()
-    if (!snapshots?.length) structuredCompactionSnapshots.delete(sessionID)
-    return snapshot
-  }
-
   function clearStructuredCapture(sessionID: string) {
     pendingCompactionCaptures.delete(sessionID)
     structuredCompactionSnapshots.delete(sessionID)
     failedCompactionCaptures.delete(sessionID)
-    blockedCompactionRequests.delete(sessionID)
-    pendingCompactionBoundaries.delete(sessionID)
+  }
+
+  function invalidateCompactOperations(sessionID: string) {
+    for (const sessions of compactOperationsByProvider.values()) {
+      const operation = sessions.get(sessionID)
+      if (!operation) continue
+      // Keep a small tombstone so a headerless late retry cannot become a new text compaction.
+      operation.invalidated = true
+      operation.snapshot = undefined
+      operation.prepared = undefined
+      operation.result = undefined
+    }
+    pendingCompactResults.delete(sessionID)
+  }
+
+  function createCompactOperation(
+    providerID: string,
+    sessionID: string,
+    requiresID: boolean,
+    boundary?: MessageBoundary,
+  ): CompactOperation {
+    const sessions = getProviderSessionMap(compactOperationsByProvider, providerID)
+    const previous = sessions.get(sessionID)
+    if (previous) {
+      previous.invalidated = true
+      previous.snapshot = undefined
+      previous.prepared = undefined
+      previous.result = undefined
+    }
+    const operation: CompactOperation = {
+      id: randomUUID(), providerID, sessionID, requiresID, createdAt: Date.now(), boundary,
+      snapshot: structuredCompactionSnapshots.get(sessionID),
+      failure: failedCompactionCaptures.has(sessionID) || pendingCompactionCaptures.has(sessionID)
+        ? "OpenAI compact structured history could not be captured safely"
+        : undefined,
+    }
+    clearStructuredCapture(sessionID)
+    sessions.set(sessionID, operation)
+    return operation
   }
 
   function clearNativeFallbackSession(sessionID: string) {
+    invalidateCompactOperations(sessionID)
     store.deleteSession(sessionID)
     pendingNativeCompactions.delete(sessionID)
     for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
     for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
     for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
     pendingCompactResults.delete(sessionID)
-    pendingCompactionBoundaries.delete(sessionID)
     clearStructuredCapture(sessionID)
   }
 
@@ -1445,6 +1505,215 @@ export function createCompactHooks(
     return { ...fetchInitForReroute(requestInput, init, headers), body: JSON.stringify(next) }
   }
 
+  function prepareCompactOperation(
+    operation: CompactOperation,
+    originalBody: string,
+    url: URL,
+    headers: Headers,
+    provider: ProviderConfig,
+  ): PreparedCompactRequest | undefined {
+    const { providerID, sessionID, snapshot } = operation
+    let body = parseJsonRecord(originalBody)
+    const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
+    if (body && Array.isArray(body.input) && checkpoint) {
+      body = { ...body, input: [...structuredClone(checkpoint.items), ...postCompactionInput(body.input, config.summary)] }
+    }
+    const target = usesOpenAIOAuth(providerID, headers) ? chatGPTCodexResponsesEndpoint : url.href
+    if (!body || typeof body.model !== "string" || !Array.isArray(body.input)) {
+      if (snapshot) {
+        operation.failure = "OpenAI compact structured request could not be prepared safely"
+        return undefined
+      }
+      return { body: originalBody, target, model: "", summary: config.summary, passthrough: true }
+    }
+
+    const conversation = snapshot?.conversation?.providerID === providerID ? snapshot.conversation : undefined
+    const model = provider.compactModel ?? conversation?.modelID ?? body.model
+    const reasoningEffort = provider.compactReasoningEffort ?? conversation?.reasoningEffort ??
+      compactReasoningEffort(asRecord(body.reasoning)?.effort) ?? null
+    const attachmentFallbacks = new Map<AnyRecord, AnyRecord>()
+    const input = structuredInputFor(providerID, sessionID, model, snapshot, attachmentFallbacks)
+    if (snapshot && !input) {
+      operation.failure = "OpenAI compact structured history could not be converted safely"
+      return undefined
+    }
+    if (!input && !isKnownOpenCodeCompactionBody(body)) {
+      return { body: JSON.stringify(body), target, model, summary: config.summary, passthrough: true }
+    }
+
+    const compact = compactBody(body, model, config, reasoningEffort)
+    delete compact.instructions
+    if (input) compact.input = [...input, { type: "compaction_trigger" }]
+    const request = withStableInstructions(
+      compact,
+      stableInstructionsByProvider.get(providerID)?.get(sessionID),
+      config.compactBodyKeys.includes("instructions"),
+    )
+    return {
+      body: JSON.stringify(request),
+      fallbackBody: attachmentFallbacks.size
+        ? JSON.stringify({ ...request, input: attachmentFallbackInput(request.input, attachmentFallbacks) })
+        : undefined,
+      target, model, summary: config.summary, passthrough: false,
+    }
+  }
+
+  async function runCompactOperation(
+    operation: CompactOperation,
+    requestInput: RequestInfo | URL,
+    init: RequestInit | undefined,
+    headers: Headers,
+    baseFetch: FetchLike,
+  ): Promise<Response> {
+    const prepared = operation.prepared!
+    const signal = init?.signal !== undefined ? init.signal : (requestInput instanceof Request ? requestInput.signal : undefined)
+    const send = async () => {
+      if (operation.invalidated || disposed) {
+        return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+      }
+      const oauth = usesOpenAIOAuth(operation.providerID, headers)
+      const target = oauth ? chatGPTCodexResponsesEndpoint : urlOf(requestInput)!.href
+      if (target !== prepared.target) {
+        return new Response("OpenAI compact operation cannot change its target endpoint", { status: 400 })
+      }
+      const outboundHeaders = new Headers(headers)
+      outboundHeaders.set("content-type", "application/json")
+      let request: RequestInit = {
+        ...fetchInitForReroute(requestInput, init, outboundHeaders),
+        method: "POST",
+        body: prepared.body,
+      }
+      if (oauth) request = await openAIOAuth.requestInit(request)
+      request.signal?.throwIfAborted()
+      if (operation.invalidated || disposed) {
+        return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+      }
+      return baseFetch(prepared.target, request)
+    }
+    let response = await send()
+    if (prepared.fallbackBody && await isAttachmentRejection(response)) {
+      // Promote before sending: a failed fallback attempt must never restore the original attachments.
+      prepared.body = prepared.fallbackBody
+      prepared.fallbackBody = undefined
+      response = await send()
+    }
+    if (operation.invalidated || disposed) {
+      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+    }
+    signal?.throwIfAborted()
+    if (!response.ok) return response
+
+    if (!prepared.passthrough) {
+      const payload = await compactV2Payload(response).catch(() => undefined)
+      if (operation.invalidated || disposed) {
+        return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+      }
+      signal?.throwIfAborted()
+      const compaction = asRecord(payload?.compaction)
+      const items = compaction ? compactedItemsForV2(JSON.parse(prepared.body).input, compaction) : undefined
+      if (!items) {
+        return new Response("OpenAI compact response stream must complete with exactly one valid compaction item", {
+          status: 502,
+        })
+      }
+      const responseID = typeof payload?.id === "string" ? payload.id : undefined
+      if (!responseID) {
+        return new Response("OpenAI compact response.completed event must contain a response id", { status: 502 })
+      }
+      const checkpoint = addCheckpoint(
+        operation.providerID,
+        operation.sessionID,
+        responseID,
+        operation.boundary ?? { messageID: responseMessageID(responseID), createdAt: operation.createdAt },
+        items,
+      )
+      if (operation.boundary) pendingCompactResults.delete(operation.sessionID)
+      else pendingCompactResults.set(operation.sessionID, { providerID: operation.providerID, responseID, items })
+      getProviderSessionMap(activeCheckpointByProvider, operation.providerID).set(operation.sessionID, checkpoint)
+      response = sseResponse({
+        responseID,
+        model: typeof payload?.model === "string" ? payload.model : prepared.model,
+        createdAt: typeof payload?.created_at === "number" ? payload.created_at : Math.floor(operation.createdAt / 1000),
+        summary: prepared.summary,
+        usage: asRecord(payload?.usage),
+      })
+    }
+    operation.result = response
+    operation.completed = true
+    operation.prepared = undefined
+    return response
+  }
+
+  async function fetchCompactOperation(
+    providerID: string,
+    provider: ProviderConfig,
+    sessionID: string,
+    operationID: string | null,
+    requestInput: RequestInfo | URL,
+    init: RequestInit | undefined,
+    headers: Headers,
+    baseFetch: FetchLike,
+  ): Promise<Response> {
+    let operation = compactOperationsByProvider.get(providerID)?.get(sessionID)
+    if (operationID !== null) {
+      if (!operation || !operation.requiresID || operation.id !== operationID) {
+        return new Response("OpenAI compact operation is unavailable; start a new compaction", { status: 400 })
+      }
+    } else {
+      if (operation?.requiresID && !structuredCompactionSnapshots.has(sessionID) && !failedCompactionCaptures.has(sessionID)) {
+        return new Response("OpenAI compact operation ID is required", { status: 400 })
+      }
+      if (!operation || structuredCompactionSnapshots.has(sessionID) || failedCompactionCaptures.has(sessionID)) {
+        operation = createCompactOperation(providerID, sessionID, false)
+      }
+    }
+    if (disposed || (operation.invalidated && (operationID !== null || !operation.completed))) {
+      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+    }
+
+    const text = await bodyText(requestInput, init)
+    if (disposed || compactOperationsByProvider.get(providerID)?.get(sessionID) !== operation ||
+      pendingCompactionCaptures.has(sessionID) || structuredCompactionSnapshots.has(sessionID) ||
+      failedCompactionCaptures.has(sessionID)) {
+      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+    }
+    if (text === undefined) {
+      return new Response("OpenAI compact request body could not be read safely", { status: 400 })
+    }
+    const url = urlOf(requestInput)!
+    const method = (init?.method ?? (requestInput instanceof Request ? requestInput.method : "GET")).toUpperCase()
+    const fingerprint = createHash("sha256").update(JSON.stringify([url.href, method, text])).digest("hex")
+    if (operation.fingerprint && operation.fingerprint !== fingerprint) {
+      if (operationID === null && operation.completed) operation = createCompactOperation(providerID, sessionID, false)
+      else return new Response("OpenAI compact operation cannot change its original request", { status: 400 })
+    }
+    if (operation.invalidated || disposed) {
+      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+    }
+    operation.fingerprint = fingerprint
+    const signal = init?.signal !== undefined ? init.signal : (requestInput instanceof Request ? requestInput.signal : undefined)
+    signal?.throwIfAborted()
+    if (operation.failure) return new Response(operation.failure, { status: 502 })
+    if (operation.result) return operation.result.clone()
+    if (!operation.prepared) {
+      try {
+        operation.prepared = prepareCompactOperation(operation, text, url, headers, provider)
+      } catch {
+        operation.failure = "OpenAI compact structured request could not be prepared safely"
+      }
+      operation.snapshot = undefined
+      if (!operation.prepared) return new Response(operation.failure, { status: 502 })
+    }
+    if (!operation.inFlight) {
+      const current = operation
+      current.inFlight = runCompactOperation(current, requestInput, init, headers, baseFetch)
+        .finally(() => { current.inFlight = undefined })
+    }
+    const response = await operation.inFlight!
+    signal?.throwIfAborted()
+    return response.clone()
+  }
+
   function wrapFetch(base: FetchLike, providerID: string, provider: ProviderConfig): FetchLike {
     const previousBase = (base as unknown as AnyRecord)[wrappedBaseFetch]
     const baseFetch = typeof previousBase === "function" ? (previousBase as FetchLike) : base
@@ -1452,10 +1721,15 @@ export function createCompactHooks(
     const wrapped = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       const url = urlOf(requestInput)
       const headers = requestHeaders(requestInput, init)
+      const operationID = headers.get(compactOperationHeader)
       const { sessionID: headerSessionID, shouldCompact, shouldNativeCompact } = compactMarkers(headers, config)
       const isResponsesRequest = url ? isResponsesUrl(url, config) : false
       const outboundHeaders = cleanedHeaders(headers, config)
 
+      if (disposed) return new Response("OpenAI compact plugin has been disposed", { status: 400 })
+      if (operationID !== null && (!isResponsesRequest || !shouldCompact)) {
+        return new Response("OpenAI compact operation requires its original compaction endpoint and markers", { status: 400 })
+      }
       if (!isResponsesRequest) {
         return baseFetch(requestInput, fetchInit(init, outboundHeaders))
       }
@@ -1464,13 +1738,12 @@ export function createCompactHooks(
       if ((shouldCompact || shouldNativeCompact) && !sessionID) {
         return new Response("OpenAI compact request is missing session header", { status: 400 })
       }
-      if (shouldCompact && sessionID && blockedCompactionRequests.delete(sessionID)) {
-        clearStructuredCapture(sessionID)
-        return new Response("OpenAI compact structured history could not be captured safely", { status: 502 })
+      if (shouldCompact && sessionID) {
+        return fetchCompactOperation(providerID, provider, sessionID, operationID, requestInput, init, outboundHeaders, baseFetch)
       }
 
       const removeLatestUser =
-        !shouldCompact && sessionID !== undefined && pendingAutoContinueRequests.get(sessionID) === providerID
+        sessionID !== undefined && pendingAutoContinueRequests.get(sessionID) === providerID
       if (removeLatestUser) pendingAutoContinueRequests.delete(sessionID)
       const nativeCompaction = sessionID ? pendingNativeCompactions.get(sessionID) : undefined
       const matchingNativeCompaction = nativeCompaction?.providerID === providerID ? nativeCompaction : undefined
@@ -1528,102 +1801,8 @@ export function createCompactHooks(
         matchingNativeCompaction.completed = true
         return retriedResponse
       }
-      if (!shouldCompact) {
-        rememberStableInstructions(providerID, sessionID, body)
-        return baseFetch(routedRequestInput, routedRequestInit)
-      }
-
-      if (typeof body?.model !== "string" || !Array.isArray(body.input) || !url) {
-        clearStructuredCapture(sessionID)
-        return baseFetch(routedRequestInput, routedRequestInit)
-      }
-
-      const snapshot = takeStructuredSnapshot(sessionID)
-      const conversation = snapshot?.conversation?.providerID === providerID ? snapshot.conversation : undefined
-      const selectedModel = provider.compactModel ?? conversation?.modelID ?? body.model
-      const selectedReasoningEffort =
-        provider.compactReasoningEffort ??
-        conversation?.reasoningEffort ??
-        compactReasoningEffort(asRecord(body.reasoning)?.effort) ??
-        null
-      const attachmentFallbacks = new Map<AnyRecord, AnyRecord>()
-      const structuredInput = structuredInputFor(providerID, sessionID, selectedModel, snapshot, attachmentFallbacks)
-      if (snapshot && !structuredInput) {
-        clearStructuredCapture(sessionID)
-        return new Response("OpenAI compact structured history could not be converted safely", { status: 502 })
-      }
-      if (!structuredInput) clearStructuredCapture(sessionID)
-      if (!structuredInput && !isKnownOpenCodeCompactionBody(body)) {
-        return baseFetch(routedRequestInput, routedRequestInit)
-      }
-
-      const outboundCompactHeaders = new Headers(routedRequestInit.headers)
-      outboundCompactHeaders.set("content-type", "application/json")
-      const compactBodyWithHistory = compactBody(body, selectedModel, config, selectedReasoningEffort)
-      delete compactBodyWithHistory.instructions
-      if (structuredInput) compactBodyWithHistory.input = [...structuredInput, { type: "compaction_trigger" }]
-      let compactRequestBody = withStableInstructions(
-        compactBodyWithHistory,
-        stableInstructionsByProvider.get(providerID)?.get(sessionID),
-        config.compactBodyKeys.includes("instructions"),
-      )
-      let compacted = await baseFetch(routedRequestInput, {
-        ...routedRequestInit,
-        method: "POST",
-        headers: outboundCompactHeaders,
-        body: JSON.stringify(compactRequestBody),
-      })
-      if (attachmentFallbacks.size && await isAttachmentRejection(compacted)) {
-        compactRequestBody = {
-          ...compactRequestBody,
-          input: attachmentFallbackInput(compactRequestBody.input, attachmentFallbacks),
-        }
-        compacted = await baseFetch(routedRequestInput, {
-          ...routedRequestInit,
-          method: "POST",
-          headers: outboundCompactHeaders,
-          body: JSON.stringify(compactRequestBody),
-        })
-      }
-      if (!compacted.ok) {
-        clearStructuredCapture(sessionID)
-        return compacted
-      }
-
-      const payload = await compactV2Payload(compacted.clone()).catch(() => undefined)
-      const compaction = asRecord(payload?.compaction)
-      const items = compaction ? compactedItemsForV2(compactRequestBody.input, compaction) : undefined
-      if (!items) {
-        clearStructuredCapture(sessionID)
-        return new Response("OpenAI compact response stream must complete with exactly one valid compaction item", {
-          status: 502,
-        })
-      }
-      const responseID = typeof payload?.id === "string" ? payload.id : undefined
-      if (!responseID) {
-        clearStructuredCapture(sessionID)
-        return new Response("OpenAI compact response.completed event must contain a response id", { status: 502 })
-      }
-
-      const capturedBoundary = pendingCompactionBoundaries.get(sessionID)
-      pendingCompactionBoundaries.delete(sessionID)
-      const checkpoint = addCheckpoint(
-        providerID,
-        sessionID,
-        responseID,
-        capturedBoundary ?? { messageID: responseMessageID(responseID), createdAt: Date.now() },
-        items,
-      )
-      if (capturedBoundary) pendingCompactResults.delete(sessionID)
-      else pendingCompactResults.set(sessionID, { providerID, responseID, items })
-      getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
-      return sseResponse({
-        responseID,
-        model: typeof payload?.model === "string" ? payload.model : selectedModel,
-        createdAt: typeof payload?.created_at === "number" ? payload.created_at : Math.floor(Date.now() / 1000),
-        summary: config.summary,
-        usage: asRecord(payload?.usage),
-      })
+      rememberStableInstructions(providerID, sessionID, body)
+      return baseFetch(routedRequestInput, routedRequestInit)
     }) as FetchLike
 
     Object.defineProperty(wrapped, wrappedFetch, { value: true })
@@ -1665,9 +1844,9 @@ export function createCompactHooks(
     if (event.type === "session.deleted") {
       const sessionID = asRecord(event.properties)?.sessionID
       if (typeof sessionID !== "string") return
+      invalidateCompactOperations(sessionID)
       for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
       pendingCompactResults.delete(sessionID)
-      pendingCompactionBoundaries.delete(sessionID)
       pendingAutoContinues.delete(sessionID)
       pendingAutoContinueRequests.delete(sessionID)
       pendingNativeCompactions.delete(sessionID)
@@ -1690,6 +1869,7 @@ export function createCompactHooks(
       if (typeof sessionID !== "string" || typeof messageID !== "string") return
 
       providerByMessage.delete(messageProviderKey(sessionID, messageID))
+      invalidateCompactOperations(sessionID)
       clearStructuredCapture(sessionID)
       pendingAutoContinues.delete(sessionID)
       pendingAutoContinueRequests.delete(sessionID)
@@ -1748,6 +1928,14 @@ export function createCompactHooks(
     },
 
     async dispose() {
+      disposed = true
+      for (const sessions of compactOperationsByProvider.values()) {
+        for (const sessionID of sessions.keys()) invalidateCompactOperations(sessionID)
+      }
+      compactOperationsByProvider.clear()
+      structuredCompactionSnapshots.clear()
+      pendingCompactionCaptures.clear()
+      failedCompactionCaptures.clear()
       store.close()
     },
 
@@ -1774,6 +1962,8 @@ export function createCompactHooks(
 
     "chat.message": async (input, output) => {
       if (typeof input.sessionID === "string") {
+        invalidateCompactOperations(input.sessionID)
+        clearStructuredCapture(input.sessionID)
         pendingAutoContinues.delete(input.sessionID)
         pendingAutoContinueRequests.delete(input.sessionID)
         const message = asRecord(output.message)
@@ -1789,7 +1979,7 @@ export function createCompactHooks(
       if (typeof input.sessionID !== "string") return
 
       const hasCompactionCapture =
-        !!structuredCompactionSnapshots.get(input.sessionID)?.length || failedCompactionCaptures.has(input.sessionID)
+        structuredCompactionSnapshots.has(input.sessionID) || failedCompactionCaptures.has(input.sessionID)
       const checkpoint = activeCheckpointByProvider.get(providerID)?.get(input.sessionID)
       if (hasCompactionCapture && checkpoint && hasInvalidCheckpointHistory(checkpoint)) {
         pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
@@ -1806,24 +1996,21 @@ export function createCompactHooks(
         return
       }
 
-      if (structuredCompactionSnapshots.get(input.sessionID)?.length) {
-        pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
-        const message = asRecord(input.message)
-        const messageID = message?.id
-        const createdAt = asRecord(message?.time)?.created
-        if (typeof messageID === "string" && finiteNumber(createdAt)) {
-          pendingCompactionBoundaries.set(input.sessionID, { messageID, createdAt })
-        }
-        output.headers[config.headers.session] = input.sessionID
-        output.headers[config.headers.compact] = "1"
-        return
+      const message = asRecord(input.message)
+      const messageID = message?.id
+      const createdAt = asRecord(message?.time)?.created
+      let operation = compactOperationsByProvider.get(providerID)?.get(input.sessionID)
+      if (hasCompactionCapture) {
+        const boundary = typeof messageID === "string" && finiteNumber(createdAt) ? { messageID, createdAt } : undefined
+        operation = createCompactOperation(providerID, input.sessionID, true, boundary)
+        operation.agent = input.agent
       }
-
-      if (failedCompactionCaptures.has(input.sessionID)) {
+      if (hasCompactionCapture || (operation?.requiresID && typeof messageID === "string" &&
+        operation.boundary?.messageID === messageID && operation.agent === input.agent)) {
         pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
-        blockedCompactionRequests.add(input.sessionID)
         output.headers[config.headers.session] = input.sessionID
         output.headers[config.headers.compact] = "1"
+        output.headers[compactOperationHeader] = operation!.id
         return
       }
 
@@ -1876,8 +2063,10 @@ export function createCompactHooks(
       let rawMessages: MessageEntry[] | undefined
       if (sessionID && providerID && configuredProviders.has(providerID)) {
         await inheritForkState(providerID, sessionID, messages)
+        if (pendingCaptures && pendingCompactionCaptures.get(sessionID) !== pendingCaptures) return
         if (pendingCaptures && options.getSessionMessages) {
           const value = await options.getSessionMessages(sessionID).catch(() => undefined)
+          if (pendingCompactionCaptures.get(sessionID) !== pendingCaptures) return
           if (Array.isArray(value)) rawMessages = value as MessageEntry[]
         }
         if (pendingCaptures && !activeCheckpointByProvider.get(providerID)?.has(sessionID)) {
@@ -1901,13 +2090,10 @@ export function createCompactHooks(
         : undefined
       if (providerID && configuredProviders.has(providerID)) trimMessagesAfterCheckpoint(providerID, messages)
       if (sessionID && pendingCaptures) {
-        if (pendingCaptures === 1) pendingCompactionCaptures.delete(sessionID)
-        else pendingCompactionCaptures.set(sessionID, pendingCaptures - 1)
+        pendingCompactionCaptures.delete(sessionID)
         if (snapshot) {
           failedCompactionCaptures.delete(sessionID)
-          const snapshots = structuredCompactionSnapshots.get(sessionID) ?? []
-          snapshots.push(snapshot)
-          structuredCompactionSnapshots.set(sessionID, snapshots)
+          structuredCompactionSnapshots.set(sessionID, snapshot)
         } else {
           failedCompactionCaptures.add(sessionID)
         }
@@ -1923,12 +2109,12 @@ export function createCompactHooks(
 
     "experimental.session.compacting": async (input) => {
       if (typeof input.sessionID !== "string") return
+      invalidateCompactOperations(input.sessionID)
+      clearStructuredCapture(input.sessionID)
       pendingAutoContinues.delete(input.sessionID)
       pendingAutoContinueRequests.delete(input.sessionID)
       pendingNativeCompactions.delete(input.sessionID)
-      failedCompactionCaptures.delete(input.sessionID)
-      blockedCompactionRequests.delete(input.sessionID)
-      pendingCompactionCaptures.set(input.sessionID, (pendingCompactionCaptures.get(input.sessionID) ?? 0) + 1)
+      pendingCompactionCaptures.set(input.sessionID, Symbol())
     },
 
     "experimental.compaction.autocontinue": async (input) => {

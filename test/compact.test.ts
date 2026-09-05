@@ -942,7 +942,7 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
-  test("falls back to embedded history when structured messages cannot be cloned", async () => {
+  test("rejects embedded history retries when structured messages cannot be cloned", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
@@ -987,7 +987,7 @@ describe("OpenAI compact hooks", () => {
         "## Objective\n- Preserve the fallback",
         "</prior-summary>",
       ].join("\n\n")
-      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+      const request = {
         method: "POST",
         headers: {
           [defaultConfig.headers.compact]: "1",
@@ -999,16 +999,14 @@ describe("OpenAI compact hooks", () => {
             "You are a context summarization agent. You are given a conversation between a user and an agent.",
           input: [{ role: "user", content: embedded }],
         }),
-      })
-
-      expect(jsonBody(calls[0]?.init)).toEqual({
-        model: "ignored",
-        input: [{ role: "user", content: embedded }, { type: "compaction_trigger" }],
-        tool_choice: "auto",
-        store: false,
-        stream: true,
-        include: ["reasoning.encrypted_content"],
-      })
+      }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await wrappedFetch("https://proxy.test/openai/v1/responses", request)
+        expect(response.status).toBe(502)
+        expect(await response.text()).toContain("could not be captured safely")
+      }
+      expect(calls).toEqual([])
+      expect(store.count()).toBe(0)
     } finally {
       store.close()
     }
@@ -2109,7 +2107,7 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
-  test("passes through an unknown compaction format after capture fails and clears its state", async () => {
+  test("keeps failed capture blocked even when the serialized compaction format is unknown", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
@@ -2151,12 +2149,9 @@ describe("OpenAI compact hooks", () => {
         body: JSON.stringify(body),
       })
 
-      expect(await response.text()).toBe("original summary response")
-      expect(calls).toHaveLength(1)
-      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
-      expect(jsonBody(calls[0]?.init)).toEqual(body)
-      expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.compact)).toBe(false)
-      expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.session)).toBe(false)
+      expect(response.status).toBe(502)
+      expect(await response.text()).toContain("could not be captured safely")
+      expect(calls).toEqual([])
       expect(store.count()).toBe(0)
 
       await hooks["experimental.chat.messages.transform"]?.(
@@ -2178,7 +2173,9 @@ describe("OpenAI compact hooks", () => {
         },
         body: JSON.stringify(body),
       })
-      expect(await second.text()).toBe("original summary response")
+      expect(second.status).toBe(502)
+      expect(await second.text()).toContain("could not be captured safely")
+      expect(calls).toEqual([])
       expect(store.count()).toBe(0)
     } finally {
       store.close()
