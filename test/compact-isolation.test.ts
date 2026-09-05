@@ -60,6 +60,7 @@ async function setup(invalid = false) {
   })
   const hooks = createCompactHooks(config, store, network as typeof fetch, {
     getSessionMessages: (id) => source.read(id),
+    getSessionStatus: fixture.getSessionStatus,
   })
   const cfg: any = {}
   await hooks.config?.(cfg)
@@ -257,6 +258,7 @@ describe("compaction capture ownership", () => {
     const f = await setup()
     try {
       const old = await f.begin()
+      await f.fixture.finish(f.hooks, sessionID)
       const next = await f.begin("openai")
       if (kind === "headers") expect(await f.headers(old.request)).toEqual({})
       else await f.hooks["experimental.compaction.autocontinue"]?.(old.request as any, { enabled: true })
@@ -285,7 +287,7 @@ describe("compaction capture ownership", () => {
     } finally { f.store.close() }
   })
 
-  test.each(["user", "removed", "deleted", "new-compaction", "dispose"])(
+  test.each(["user", "removed", "deleted", "cancel-and-restart", "dispose"])(
     "delayed headers verification cannot publish after %s", async (action) => {
       const f = await setup()
       let disposed = false
@@ -306,7 +308,10 @@ describe("compaction capture ownership", () => {
           type: "message.removed", properties: { sessionID, messageID: old.request.message.id },
         } as any })
         if (action === "deleted") await f.hooks.event?.({ event: { type: "session.deleted", properties: { sessionID } } as any })
-        if (action === "new-compaction") next = await f.begin("openai")
+        if (action === "cancel-and-restart") {
+          await f.fixture.cancel(f.hooks, sessionID)
+          next = await f.begin("openai")
+        }
         if (action === "dispose") { await f.hooks.dispose?.(); disposed = true }
         gate.resolve(oldRaw)
         expect((await pending)[operationHeader]).toBeUndefined()
@@ -346,6 +351,7 @@ describe("compaction capture ownership", () => {
     try {
       const previous = await f.begin("openai")
       await f.send(await f.headers(previous.request))
+      await f.fixture.finish(f.hooks, sessionID)
       const checkpoint = structuredClone(f.store.loadAll())
       const unsupported = await f.begin()
       await f.headers(unsupported.request)
@@ -435,6 +441,7 @@ describe("compaction capture ownership", () => {
       const oldHeaders = await f.headers(old.request)
       expect(oldHeaders[f.config.headers.compact]).toBe("native")
       expect(oldHeaders[operationHeader]).toBeTruthy()
+      await f.fixture.cancel(f.hooks, sessionID)
       const next = await f.begin("openai")
       const headers = await f.headers(next.request)
       const invalid = { ...headers }
@@ -484,6 +491,7 @@ describe("compaction capture ownership", () => {
       f.network.mockImplementationOnce(async () => { started.resolve(); return gate.promise })
       const pending = f.send(headers)
       await started.promise
+      await f.fixture.cancel(f.hooks, sessionID)
       const next = await f.begin("openai")
       const nextHeaders = await f.headers(next.request)
       gate.resolve(new Response("late native summary"))

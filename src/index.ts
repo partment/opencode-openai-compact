@@ -16,6 +16,14 @@ export const server: Plugin = async ({ client, directory, worktree }) => {
       const result = await client.session.messages({ path: { id: sessionID } })
       return result.data
     },
+    async getSessionStatus(sessionID) {
+      const result = await client.session.status()
+      const statuses = result.data
+      if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) return undefined
+      if (Object.values(statuses).some((status) => !status || Array.isArray(status) ||
+        (status.type !== "idle" && status.type !== "busy" && status.type !== "retry"))) return undefined
+      return Object.hasOwn(statuses, sessionID) ? statuses[sessionID].type : "idle"
+    },
     async setOpenAIAuth(auth) {
       await client.auth.set({ path: { id: "openai" }, body: auth as any })
     },

@@ -13,6 +13,8 @@ type CaptureInput = {
 // transform, and only then persists a summary assistant before chat.headers.
 export function compactionFixture(rawHistory?: (sessionID: string) => Promise<unknown>) {
   const sessions = new Map<string, any[]>()
+  const statuses = new Map<string, "idle" | "busy" | "retry">()
+  const getSessionStatus = async (sessionID: string) => statuses.get(sessionID) ?? "busy"
   const getSessionMessages = async (sessionID: string) => sessions.get(sessionID) ?? await rawHistory?.(sessionID)
 
   async function prepare(input: CaptureInput) {
@@ -68,5 +70,20 @@ export function compactionFixture(rawHistory?: (sessionID: string) => Promise<un
     return output.headers
   }
 
-  return { getSessionMessages, prepare, addSummary, capture, sessions }
+  async function finish(hooks: Hooks, sessionID: string, error?: unknown) {
+    const summary = sessions.get(sessionID)!.findLast((message) => message.info.summary === true)!
+    summary.info = {
+      ...summary.info, finish: error ? "error" : "stop", error,
+      time: { ...summary.info.time, completed: Math.max(Date.now(), summary.info.time.created + 1) },
+    }
+    await hooks.event?.({ event: { type: "message.updated", properties: { sessionID, info: summary.info } } as any })
+  }
+
+  async function cancel(hooks: Hooks, sessionID: string) {
+    statuses.set(sessionID, "idle")
+    await hooks.event?.({ event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } } as any })
+    statuses.set(sessionID, "busy")
+  }
+
+  return { getSessionMessages, getSessionStatus, prepare, addSummary, capture, finish, cancel, sessions, statuses }
 }

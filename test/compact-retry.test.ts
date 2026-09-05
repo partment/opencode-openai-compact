@@ -72,7 +72,9 @@ async function retrySession(
   if (options.invalid === "clone") (history[0].parts[0] as any).metadata = { uncloneable: () => undefined }
   if (options.invalid === "convert") (history[1].parts[1] as any).state.output = undefined
   const fixture = compactionFixture()
-  const hooks = createCompactHooks(config, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
+  const hooks = createCompactHooks(config, store, fakeFetch, {
+    getSessionMessages: fixture.getSessionMessages, getSessionStatus: fixture.getSessionStatus,
+  })
   const cfg: any = {}
   try {
     await hooks.config?.(cfg)
@@ -303,7 +305,7 @@ describe("immutable compaction retries", () => {
     } finally { f.store.close() }
   })
 
-  test.each(["user", "removed", "deleted", "new-compaction", "dispose"])(
+  test.each(["user", "removed", "deleted", "cancel-and-restart", "dispose"])(
     "does not commit an in-flight result after %s", async (event) => {
       const gate = deferred<Response>()
       const started = deferred<void>()
@@ -329,9 +331,12 @@ describe("immutable compaction retries", () => {
         if (event === "deleted") await f.hooks.event?.({ event: {
           type: "session.deleted", properties: { sessionID: f.sessionID },
         } as any })
-        if (event === "new-compaction") nextHeaders = await f.fixture.capture(f.hooks, {
-          sessionID: f.sessionID, boundary: { ...f.boundary, id: "msg_new_boundary" }, history: f.history, model,
-        })
+        if (event === "cancel-and-restart") {
+          await f.fixture.cancel(f.hooks, f.sessionID)
+          nextHeaders = await f.fixture.capture(f.hooks, {
+            sessionID: f.sessionID, boundary: { ...f.boundary, id: "msg_new_boundary" }, history: f.history, model,
+          })
+        }
         if (event === "dispose") { await f.hooks.dispose?.(); closed = true }
         gate.resolve(completed())
         expect((await pending).status).toBe(400)
@@ -371,10 +376,13 @@ describe("immutable compaction retries", () => {
       controller.abort(new Error("cancelled attempt"))
       await rejected
       expect(f.store.count()).toBe(1)
-      const signal = new AbortController().signal
+      const retryAbort = new AbortController()
+      const signal = retryAbort.signal
       const response = kind === "request" ? await f.fetch(request, { signal }) : await f.fetch(url, { ...init, signal })
       expect(response.status).toBe(200)
-      expect(sent[1].signal).toBe(signal)
+      expect(sent[1].signal?.aborted).toBe(false)
+      retryAbort.abort(new Error("fresh signal"))
+      expect(sent[1].signal?.reason).toBe(signal.reason)
       expect(sent[1].body).toBe(sent[0].body)
       expect(request.bodyUsed).toBe(false)
     } finally { f.store.close() }
@@ -443,6 +451,7 @@ describe("immutable compaction retries", () => {
       const gate = deferred<unknown>()
       let reads = 0
       const hooks = createCompactHooks(f.config, f.store, network, {
+        getSessionStatus: f.fixture.getSessionStatus,
         async getSessionMessages(sessionID) {
           if (++reads === 1) { started.resolve(); return gate.promise }
           return f.fixture.getSessionMessages(sessionID)
@@ -454,6 +463,7 @@ describe("immutable compaction retries", () => {
       const oldRaw = f.fixture.sessions.get(f.sessionID)
       const first = hooks["experimental.session.compacting"]?.({ sessionID: f.sessionID }, { context: [] })
       await started.promise
+      await f.fixture.cancel(hooks, f.sessionID)
       const newer = structuredClone(f.history)
       newer[0].parts[0].text = "new capture"
       const headers = await f.fixture.capture(hooks, {

@@ -263,17 +263,6 @@ describe("OpenAI OAuth hooks", () => {
       expect(calls[0]?.url).toBe("https://api.openai.com/v1/responses")
       expect(store.count()).toBe(1)
 
-      await apiHooks.event?.({
-        event: {
-          type: "message.part.updated",
-          properties: {
-            sessionID: "ses_switch",
-            part: { messageID: "msg_api_checkpoint", type: "text", text: defaultConfig.summary },
-            time: 2,
-          },
-        } as any,
-      })
-      expect(store.count()).toBe(1)
 
       const oauthHooks = createCompactHooks(defaultConfig, store, fakeFetch)
       await oauthHooks.auth?.loader?.(
@@ -290,7 +279,9 @@ describe("OpenAI OAuth hooks", () => {
       await oauthHooks.config?.(oauthCfg)
       await oauthHooks["experimental.chat.messages.transform"]?.(
         {},
-        { messages: [{ info: { id: "msg_after", sessionID: "ses_switch", time: { created: 3 } } }] } as any,
+        { messages: [{ info: {
+          id: "msg_after", sessionID: "ses_switch", time: { created: store.loadAll()[0].checkpoint.afterCreatedAt + 1 },
+        } }] } as any,
       )
 
       calls.length = 0

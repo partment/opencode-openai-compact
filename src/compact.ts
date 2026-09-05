@@ -64,7 +64,8 @@ type MessageEntry = {
   }>
 }
 type MessageBoundary = { messageID: string; createdAt: number }
-type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
+type SessionStatus = "idle" | "busy" | "retry"
+type SessionGeneration = { deleted: boolean; activity: number; revert?: string }
 type PendingAutoContinue = {
   providerID: string
   agent?: string
@@ -93,12 +94,14 @@ type CompactionCapture = {
   id: string
   sessionID: string
   createdAt: number
+  generation: SessionGeneration
+  controller: AbortController
   phase: "pending" | "ready" | "bound" | "native" | "ignored" | "invalidated"
   boundary?: MessageBoundary
   rawMessages?: MessageEntry[]
   priorSummaryIDs?: Set<string>
   snapshot?: StructuredCompactionSnapshot
-  binding?: { providerID: string; modelID: string; agent: string }
+  binding?: { providerID: string; modelID: string; agent: string; summaryID: string }
 }
 type PreparedCompactRequest = {
   body: string
@@ -114,7 +117,9 @@ type CompactOperation = {
   providerID: string
   sessionID: string
   createdAt: number
-  boundary?: MessageBoundary
+  generation: SessionGeneration
+  controller: AbortController
+  boundary: MessageBoundary
   snapshot?: StructuredCompactionSnapshot
   fingerprint?: string
   prepared?: PreparedCompactRequest
@@ -130,11 +135,14 @@ type CompactHookOptions = {
   setOpenAIAuth?: (auth: OpenAIOAuthAuth) => Promise<void>
   tokenFetch?: OAuthFetchLike
   getSessionMessages?: (sessionID: string) => Promise<unknown>
+  getSessionStatus?: (sessionID: string) => Promise<SessionStatus | undefined>
 }
 
 const wrappedFetch = "__opencodeOpenAICompactFetch"
 const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
 const compactOperationHeader = "x-opencode-openai-compact-operation"
+const compactBusyMessage = "OpenAI compact operation is already in progress for this session"
+const compactInvalidMessage = "OpenAI compact operation is no longer valid; start a new compaction"
 const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 const openCodeCompactionDeveloperPromptStarts = [
   "You are an anchored context summarization assistant for coding sessions.",
@@ -874,7 +882,15 @@ function isAfterBoundary(info: MessageEntry["info"], boundary: MessageBoundary) 
     createdAt > boundary.createdAt || (createdAt === boundary.createdAt && info.id > boundary.messageID)
 }
 
-function compactionBoundaryFrom(messages: MessageEntry[], sessionID: string): MessageBoundary | undefined {
+function isCompactionUser(message: MessageEntry) {
+  const info = message?.info
+  return info?.role === "user" && Array.isArray(message.parts) && message.parts.some((part) =>
+    part?.type === "compaction" && part.messageID === info.id && part.sessionID === info.sessionID)
+}
+
+function compactionBoundaryFrom(
+  messages: MessageEntry[], sessionID: string, fixed?: MessageBoundary,
+): MessageBoundary | undefined {
   let latest: MessageEntry | undefined
   const ids = new Set<string>()
   for (const message of messages) {
@@ -883,13 +899,17 @@ function compactionBoundaryFrom(messages: MessageEntry[], sessionID: string): Me
     ids.add(info.id)
     if (info.role !== "user") continue
     if (!finiteNumber(info.time?.created)) return undefined
+    if (fixed) {
+      if (info.id === fixed.messageID && info.time.created === fixed.createdAt) latest = message
+      if (isAfterBoundary(info, fixed) && !isCompactionUser(message)) return undefined
+      continue
+    }
     if (!latest || isAfterBoundary(info, { messageID: latest.info!.id!, createdAt: latest.info!.time!.created! })) {
       latest = message
     }
   }
   const info = latest?.info
-  if (!info || !Array.isArray(latest?.parts) || !latest.parts.some((part) => part?.type === "compaction" &&
-    part.messageID === info.id && part.sessionID === sessionID)) return undefined
+  if (!info || !latest || !isCompactionUser(latest)) return undefined
   if (messages.some((message) => message.info?.role === "assistant" && message.info.summary === true &&
     message.info.parentID === info.id && message.info.finish && !message.info.error)) return undefined
   return { messageID: info.id!, createdAt: info.time!.created! }
@@ -1060,13 +1080,14 @@ export function createCompactHooks(
     messages.set(control.messageID, control)
     sessions.set(control.sessionID, messages)
   }
-  const pendingCompactResults = new Map<string, PendingCompactResult>()
   const pendingAutoContinues = new Map<string, PendingAutoContinue>()
   const pendingAutoContinueRequests = new Map<string, string>()
   const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
   const stableInstructionsByProvider = new Map<string, Map<string, StableInstructions>>()
   const pendingSystemByProvider = new Map<string, Map<string, string>>()
   const providerByMessage = new Map<string, string>()
+  const sessionGenerations = new Map<string, SessionGeneration>()
+  const compactionOwners = new Map<string, string>()
   const compactionCaptures = new Map<string, CompactionCapture>()
   const compactOperationsByProvider = new Map<string, Map<string, CompactOperation>>()
   const pendingNativeCompactions = new Map<string, PendingNativeCompaction>()
@@ -1232,7 +1253,8 @@ export function createCompactHooks(
   ) {
     const getSessionMessages = options.getSessionMessages
     const capturePhase = capture?.phase
-    if (!getSessionMessages) return
+    const generation = sessionGeneration(sessionID)
+    if (!getSessionMessages || !currentSession(sessionID, generation)) return
     const providerSessions = checkpointsByProvider.get(providerID)
     if (!providerSessions || providerSessions.has(sessionID)) return
 
@@ -1244,8 +1266,8 @@ export function createCompactHooks(
     }
     if (!boundaryTimes.size) return
 
-    const childValue = await getSessionMessages(sessionID).catch(() => undefined)
-    if (!Array.isArray(childValue) || disposed || compactionCaptures.get(sessionID) !== capture ||
+    const childValue = await readSessionMessages(sessionID)
+    if (!Array.isArray(childValue) || !currentSession(sessionID, generation) || compactionCaptures.get(sessionID) !== capture ||
       capture?.phase !== capturePhase) return
     const childMessages = childValue as MessageEntry[]
     const childFingerprints = childMessages.map(forkMessageFingerprint)
@@ -1256,8 +1278,11 @@ export function createCompactHooks(
             return undefined
           }
 
-          const value = await getSessionMessages(sourceSessionID).catch(() => undefined)
-          if (!Array.isArray(value)) return undefined
+          const sourceGeneration = sessionGeneration(sourceSessionID)
+          if (!currentSession(sourceSessionID, sourceGeneration)) return undefined
+          const value = await readSessionMessages(sourceSessionID)
+          if (!Array.isArray(value) || !currentSession(sourceSessionID, sourceGeneration) ||
+            providerSessions.get(sourceSessionID) !== checkpoints) return undefined
           const sourceMessages = value as MessageEntry[]
           const limit = Math.min(sourceMessages.length, childMessages.length)
           let prefixLength = 0
@@ -1282,6 +1307,8 @@ export function createCompactHooks(
 
           return {
             sourceSessionID,
+            sourceGeneration,
+            checkpoints,
             prefixLength,
             messageIDs,
             inherited,
@@ -1292,8 +1319,10 @@ export function createCompactHooks(
           }
         }),
       )
-    ).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined)
-    if (!candidates.length || providerSessions.has(sessionID) || disposed || compactionCaptures.get(sessionID) !== capture ||
+    ).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined &&
+      currentSession(candidate.sourceSessionID, candidate.sourceGeneration) &&
+      providerSessions.get(candidate.sourceSessionID) === candidate.checkpoints)
+    if (!candidates.length || providerSessions.has(sessionID) || !currentSession(sessionID, generation) || compactionCaptures.get(sessionID) !== capture ||
       capture?.phase !== capturePhase) return
 
     const prefixLength = Math.max(...candidates.map((candidate) => candidate.prefixLength))
@@ -1394,19 +1423,6 @@ export function createCompactHooks(
     return checkpoint
   }
 
-  function compactCheckpointFromEvent(event: AnyRecord) {
-    if (event.type !== "message.part.updated") return undefined
-    const properties = asRecord(event.properties)
-    const sessionID = properties?.sessionID
-    const pending = typeof sessionID === "string" ? pendingCompactResults.get(sessionID) : undefined
-    const part = asRecord(properties?.part)
-    const messageID = part?.messageID
-    const createdAt = properties?.time
-    if (!pending || part?.text !== config.summary) return undefined
-    if (typeof sessionID !== "string" || typeof messageID !== "string" || !finiteNumber(createdAt)) return undefined
-    return { providerID: pending.providerID, sessionID, responseID: pending.responseID, boundary: { messageID, createdAt } }
-  }
-
   function trimMessagesAfterCheckpoint(providerID: string, messages: MessageEntry[]) {
     const sessionID = sessionIDFromMessages(messages)
     const checkpoints = sessionID ? checkpointsByProvider.get(providerID)?.get(sessionID) : undefined
@@ -1416,7 +1432,7 @@ export function createCompactHooks(
     const activeCheckpoints = getProviderSessionMap(activeCheckpointByProvider, providerID)
     if (checkpoint) {
       activeCheckpoints.set(sessionID, checkpoint)
-    } else if (clearActive && pendingCompactResults.get(sessionID)?.providerID !== providerID) {
+    } else if (clearActive) {
       activeCheckpoints.delete(sessionID)
     }
     if (!checkpoint) return
@@ -1448,14 +1464,52 @@ export function createCompactHooks(
     capture.snapshot = undefined
   }
 
+  function sessionGeneration(sessionID: string) {
+    let generation = sessionGenerations.get(sessionID)
+    if (!generation) sessionGenerations.set(sessionID, generation = { deleted: false, activity: 0 })
+    return generation
+  }
+
+  function currentSession(sessionID: string, generation: SessionGeneration) {
+    return !disposed && !generation.deleted && sessionGenerations.get(sessionID) === generation
+  }
+
+  async function readSessionMessages(sessionID: string) {
+    try { return await options.getSessionMessages?.(sessionID) }
+    catch { return undefined }
+  }
+
   function clearStructuredCapture(sessionID: string) {
     const capture = compactionCaptures.get(sessionID)
-    // Retain ownership even after disposal of history: a late headerless request is not a fresh compaction.
-    if (capture) releaseCapture(capture, "invalidated")
+    // Retain identity after releasing history: late headerless requests are not fresh compactions.
+    if (capture) {
+      releaseCapture(capture, "invalidated")
+      capture.controller.abort(new Error(compactInvalidMessage))
+    }
   }
 
   function currentCapture(capture: CompactionCapture) {
-    return !disposed && compactionCaptures.get(capture.sessionID) === capture && capture.phase !== "invalidated"
+    return currentSession(capture.sessionID, capture.generation) &&
+      compactionCaptures.get(capture.sessionID) === capture && capture.phase !== "invalidated"
+  }
+
+  function currentOperation(operation: CompactOperation) {
+    return currentSession(operation.sessionID, operation.generation) && !operation.invalidated &&
+      compactOperationsByProvider.get(operation.providerID)?.get(operation.sessionID) === operation &&
+      (operation.completed || compactionOwners.get(operation.sessionID) === operation.id)
+  }
+
+  function invalidateSession(sessionID: string, deleted = false) {
+    const previous = sessionGeneration(sessionID)
+    const generation = { deleted: deleted || previous.deleted, activity: 0, revert: previous.revert }
+    sessionGenerations.set(sessionID, generation)
+    invalidateCompactOperations(sessionID)
+    clearStructuredCapture(sessionID)
+    compactionOwners.delete(sessionID)
+    pendingNativeCompactions.delete(sessionID)
+    pendingAutoContinues.delete(sessionID)
+    pendingAutoContinueRequests.delete(sessionID)
+    return generation
   }
 
   function invalidateCompactOperations(sessionID: string) {
@@ -1467,8 +1521,65 @@ export function createCompactHooks(
       operation.snapshot = undefined
       operation.prepared = undefined
       operation.result = undefined
+      operation.controller.abort(new Error(compactInvalidMessage))
     }
-    pendingCompactResults.delete(sessionID)
+  }
+
+  function terminalCaptureSummary(capture: CompactionCapture, value: unknown) {
+    const info = asRecord(value)
+    return !!capture.boundary && info?.role === "assistant" && info.summary === true &&
+      info.sessionID === capture.sessionID && info.parentID === capture.boundary.messageID &&
+      typeof info.id === "string" && finiteNumber(asRecord(info.time)?.completed) &&
+      (capture.binding ? info.id === capture.binding.summaryID && info.providerID === capture.binding.providerID &&
+        info.modelID === capture.binding.modelID && info.agent === capture.binding.agent
+        : !capture.priorSummaryIDs?.has(info.id))
+  }
+
+  function finishCapture(capture: CompactionCapture, info: unknown) {
+    if (!currentCapture(capture) || compactionOwners.get(capture.sessionID) !== capture.id ||
+      !terminalCaptureSummary(capture, info)) return
+    const native = pendingNativeCompactions.get(capture.sessionID)
+    if (currentNativeCompaction(capture.sessionID, native) && native?.completed && isCompletedCompactionSummary(info)) {
+      clearNativeFallbackSession(capture.sessionID)
+      return
+    }
+    const operation = capture.binding && compactOperationsByProvider.get(capture.binding.providerID)?.get(capture.sessionID)
+    if (operation?.id === capture.id && operation.completed && !asRecord(info)?.error) {
+      compactionOwners.delete(capture.sessionID)
+      return
+    }
+    invalidateSession(capture.sessionID)
+  }
+
+  // Session-only notifications are hints, not ownership. Recheck the authoritative state,
+  // and ensure neither the session generation nor its owner changed while reading it.
+  async function refreshCompactionOwner(sessionID: string): Promise<SessionGeneration | undefined> {
+    const generation = sessionGeneration(sessionID)
+    const owner = compactionOwners.get(sessionID)
+    const activity = generation.activity
+    const current = () => currentSession(sessionID, generation) && compactionOwners.get(sessionID) === owner &&
+      generation.activity === activity
+    if (!owner) return current() ? generation : undefined
+    const capture = compactionCaptures.get(sessionID)
+    if (capture?.id === owner && capture.boundary && options.getSessionMessages) {
+      const raw = await readSessionMessages(sessionID)
+      if (!current()) return undefined
+      const summaries = Array.isArray(raw) ? raw.filter((message) => {
+        const info = asRecord(message?.info)
+        return info?.sessionID === sessionID && info.role === "assistant" && info.summary === true &&
+          info.parentID === capture.boundary!.messageID && typeof info.id === "string" &&
+          (capture.binding ? info.id === capture.binding.summaryID : !capture.priorSummaryIDs?.has(info.id))
+      }) : []
+      if (summaries.length === 1 && terminalCaptureSummary(capture, summaries[0].info)) {
+        finishCapture(capture, summaries[0].info)
+        return sessionGeneration(sessionID)
+      }
+    }
+    let status: SessionStatus | undefined
+    try { status = await options.getSessionStatus?.(sessionID) }
+    catch { status = undefined }
+    if (!current()) return undefined
+    return status === "idle" ? invalidateSession(sessionID) : generation
   }
 
   function createCompactOperation(
@@ -1476,17 +1587,14 @@ export function createCompactHooks(
     sessionID: string,
     capture?: CompactionCapture,
   ): CompactOperation {
+    const generation = capture?.generation ?? invalidateSession(sessionID)
     const sessions = getProviderSessionMap(compactOperationsByProvider, providerID)
-    const previous = sessions.get(sessionID)
-    if (previous) {
-      previous.invalidated = true
-      previous.snapshot = undefined
-      previous.prepared = undefined
-      previous.result = undefined
-    }
+    const id = capture?.id ?? randomUUID()
+    const createdAt = capture?.createdAt ?? Date.now()
     const operation: CompactOperation = {
-      id: capture?.id ?? randomUUID(), providerID, sessionID, requiresID: !!capture,
-      createdAt: capture?.createdAt ?? Date.now(), boundary: capture?.boundary,
+      id, providerID, sessionID, requiresID: !!capture, createdAt, generation,
+      controller: capture?.controller ?? new AbortController(),
+      boundary: capture?.boundary ?? { messageID: `msg_compact_${id}`, createdAt },
       snapshot: capture?.snapshot,
       failure: capture && !capture.snapshot
         ? "OpenAI compact structured history could not be captured safely"
@@ -1494,24 +1602,24 @@ export function createCompactHooks(
     }
     if (capture) releaseCapture(capture, "bound")
     sessions.set(sessionID, operation)
+    compactionOwners.set(sessionID, operation.id)
     return operation
   }
 
   function currentNativeCompaction(sessionID: string, pending: PendingNativeCompaction | undefined) {
     const capture = compactionCaptures.get(sessionID)
-    return !!pending && !disposed && pendingNativeCompactions.get(sessionID) === pending &&
-      capture?.phase === "native" && capture.id === pending.operationID
+    return !!pending && !!capture && currentCapture(capture) && pendingNativeCompactions.get(sessionID) === pending &&
+      capture.phase === "native" && capture.id === pending.operationID && compactionOwners.get(sessionID) === capture.id
   }
 
   function clearNativeFallbackSession(sessionID: string, preserveCapture?: CompactionCapture) {
-    invalidateCompactOperations(sessionID)
+    if (!preserveCapture) invalidateSession(sessionID)
+    else invalidateCompactOperations(sessionID)
     store.deleteSession(sessionID)
     pendingNativeCompactions.delete(sessionID)
     for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
     for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
     for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
-    pendingCompactResults.delete(sessionID)
-    if (compactionCaptures.get(sessionID) !== preserveCapture) clearStructuredCapture(sessionID)
   }
 
   function structuredInputFor(
@@ -1553,12 +1661,12 @@ export function createCompactHooks(
     removeLatestUser: boolean,
     selectedCheckpoint?: Checkpoint,
   ): Promise<RequestInit> {
+    const checkpoint = selectedCheckpoint ?? activeCheckpointByProvider.get(providerID)?.get(sessionID)
     const body = parseJsonRecord(await bodyText(requestInput, init))
     if (!body || !Array.isArray(body.input)) {
       return fetchInitForReroute(requestInput, init, headers)
     }
 
-    const checkpoint = selectedCheckpoint ?? activeCheckpointByProvider.get(providerID)?.get(sessionID)
     if (!checkpoint) return fetchInitForReroute(requestInput, init, headers)
 
     headers.set("content-type", "application/json")
@@ -1633,10 +1741,9 @@ export function createCompactHooks(
   ): Promise<Response> {
     const prepared = operation.prepared!
     const signal = init?.signal !== undefined ? init.signal : (requestInput instanceof Request ? requestInput.signal : undefined)
+    const combinedSignal = signal ? AbortSignal.any([signal, operation.controller.signal]) : operation.controller.signal
     const send = async () => {
-      if (operation.invalidated || disposed) {
-        return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
-      }
+      if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
       const oauth = usesOpenAIOAuth(operation.providerID, headers)
       const target = oauth ? chatGPTCodexResponsesEndpoint : urlOf(requestInput)!.href
       if (target !== prepared.target) {
@@ -1648,32 +1755,28 @@ export function createCompactHooks(
         ...fetchInitForReroute(requestInput, init, outboundHeaders),
         method: "POST",
         body: prepared.body,
+        signal: combinedSignal,
       }
       if (oauth) request = await openAIOAuth.requestInit(request)
+      if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
       request.signal?.throwIfAborted()
-      if (operation.invalidated || disposed) {
-        return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
-      }
       return baseFetch(prepared.target, request)
     }
     let response = await send()
     if (prepared.fallbackBody && await isAttachmentRejection(response)) {
+      if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
       // Promote before sending: a failed fallback attempt must never restore the original attachments.
       prepared.body = prepared.fallbackBody
       prepared.fallbackBody = undefined
       response = await send()
     }
-    if (operation.invalidated || disposed) {
-      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
-    }
+    if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
     signal?.throwIfAborted()
     if (!response.ok) return response
 
     if (!prepared.passthrough) {
       const payload = await compactV2Payload(response).catch(() => undefined)
-      if (operation.invalidated || disposed) {
-        return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
-      }
+      if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
       signal?.throwIfAborted()
       const compaction = asRecord(payload?.compaction)
       const items = compaction ? compactedItemsForV2(JSON.parse(prepared.body).input, compaction) : undefined
@@ -1690,11 +1793,9 @@ export function createCompactHooks(
         operation.providerID,
         operation.sessionID,
         responseID,
-        operation.boundary ?? { messageID: responseMessageID(responseID), createdAt: operation.createdAt },
+        operation.boundary,
         items,
       )
-      if (operation.boundary) pendingCompactResults.delete(operation.sessionID)
-      else pendingCompactResults.set(operation.sessionID, { providerID: operation.providerID, responseID, items })
       getProviderSessionMap(activeCheckpointByProvider, operation.providerID).set(operation.sessionID, checkpoint)
       response = sseResponse({
         responseID,
@@ -1707,6 +1808,7 @@ export function createCompactHooks(
     operation.result = response
     operation.completed = true
     operation.prepared = undefined
+    if (!operation.requiresID) compactionOwners.delete(operation.sessionID)
     return response
   }
 
@@ -1729,14 +1831,20 @@ export function createCompactHooks(
       if (compactionCaptures.has(sessionID) || operation?.requiresID) {
         return new Response("OpenAI compact operation ID is required", { status: 400 })
       }
-      if (!operation) operation = createCompactOperation(providerID, sessionID)
+      if (!operation) {
+        if (compactionOwners.has(sessionID)) return new Response(compactBusyMessage, { status: 409 })
+        operation = createCompactOperation(providerID, sessionID)
+      }
     }
-    if (disposed || (operation.invalidated && (operationID !== null || !operation.completed))) {
-      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
+    // Completed legacy operations may be replaced by a different request after a context change,
+    // but never after deletion, or while another provider owns this session.
+    const generation = sessionGeneration(sessionID)
+    if (!currentSession(sessionID, generation) || (operation.invalidated && (operationID !== null || !operation.completed))) {
+      return new Response(compactInvalidMessage, { status: 400 })
     }
 
     const text = await bodyText(requestInput, init)
-    if (disposed || compactOperationsByProvider.get(providerID)?.get(sessionID) !== operation ||
+    if (!currentSession(sessionID, generation) || compactOperationsByProvider.get(providerID)?.get(sessionID) !== operation ||
       (compactionCaptures.has(sessionID) && compactionCaptures.get(sessionID)?.id !== operation.id)) {
       return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
     }
@@ -1747,12 +1855,12 @@ export function createCompactHooks(
     const method = (init?.method ?? (requestInput instanceof Request ? requestInput.method : "GET")).toUpperCase()
     const fingerprint = createHash("sha256").update(JSON.stringify([url.href, method, text])).digest("hex")
     if (operation.fingerprint && operation.fingerprint !== fingerprint) {
-      if (operationID === null && operation.completed) operation = createCompactOperation(providerID, sessionID)
-      else return new Response("OpenAI compact operation cannot change its original request", { status: 400 })
+      if (operationID === null && operation.completed) {
+        if (compactionOwners.has(sessionID)) return new Response(compactBusyMessage, { status: 409 })
+        operation = createCompactOperation(providerID, sessionID)
+      } else return new Response("OpenAI compact operation cannot change its original request", { status: 400 })
     }
-    if (operation.invalidated || disposed) {
-      return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
-    }
+    if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
     operation.fingerprint = fingerprint
     const signal = init?.signal !== undefined ? init.signal : (requestInput instanceof Request ? requestInput.signal : undefined)
     signal?.throwIfAborted()
@@ -1768,11 +1876,17 @@ export function createCompactHooks(
       if (!operation.prepared) return new Response(operation.failure, { status: 502 })
     }
     if (!operation.inFlight) {
+      operation.generation.activity++
       const current = operation
       current.inFlight = runCompactOperation(current, requestInput, init, headers, baseFetch)
+        .catch((error) => {
+          if (!currentOperation(current)) return new Response(compactInvalidMessage, { status: 400 })
+          throw error
+        })
         .finally(() => { current.inFlight = undefined })
     }
     const response = await operation.inFlight!
+    if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
     signal?.throwIfAborted()
     return response.clone()
   }
@@ -1798,6 +1912,8 @@ export function createCompactHooks(
       }
 
       const sessionID = headerSessionID
+      const generation = sessionID ? sessionGeneration(sessionID) : undefined
+      if (generation?.deleted) return new Response(compactInvalidMessage, { status: 400 })
       if ((shouldCompact || shouldNativeCompact) && !sessionID) {
         return new Response("OpenAI compact request is missing session header", { status: 400 })
       }
@@ -1832,6 +1948,14 @@ export function createCompactHooks(
               shouldNativeCompact ? matchingNativeCompaction?.checkpoint : undefined,
             )
           : originalRequestInit
+      if (shouldNativeCompact) {
+        const controller = compactionCaptures.get(sessionID!)?.controller
+        if (!controller || !currentNativeCompaction(sessionID!, matchingNativeCompaction)) {
+          return new Response(compactInvalidMessage, { status: 400 })
+        }
+        requestInit.signal = requestInit.signal ? AbortSignal.any([requestInit.signal, controller.signal]) : controller.signal
+        originalRequestInit.signal = requestInit.signal
+      }
       const route = async (request: RequestInit) => {
         const authRequest = usesOpenAIOAuth(providerID, new Headers(request.headers))
           ? await openAIOAuth.requestInit(request)
@@ -1848,12 +1972,24 @@ export function createCompactHooks(
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
+      if (disposed || sessionGeneration(sessionID).deleted) return new Response(compactInvalidMessage, { status: 400 })
       const body = parseJsonRecord(typeof routedRequestInit.body === "string" ? routedRequestInit.body : undefined)
       if (shouldNativeCompact) {
         const unavailable = () => new Response("OpenAI native compact operation is no longer valid", { status: 400 })
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
-        const response = await baseFetch(routedRequestInput, routedRequestInit)
+        const send = async (input: RequestInfo | URL, request: RequestInit) => {
+          sessionGeneration(sessionID).activity++
+          try {
+            request.signal?.throwIfAborted()
+            return await baseFetch(input, request)
+          } catch (error) {
+            if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
+            throw error
+          }
+        }
+        const response = await send(routedRequestInput, routedRequestInit)
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
+        routedRequestInit.signal?.throwIfAborted()
         if (response.ok) {
           if (matchingNativeCompaction) matchingNativeCompaction.completed = true
           return response
@@ -1867,13 +2003,14 @@ export function createCompactHooks(
 
         const retry = await route(originalRequestInit)
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
-        const retriedResponse = await baseFetch(retry.input, retry.init)
+        const retriedResponse = await send(retry.input, retry.init)
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
+        retry.init.signal?.throwIfAborted()
         if (!retriedResponse.ok) return response
         matchingNativeCompaction.completed = true
         return retriedResponse
       }
-      rememberStableInstructions(providerID, sessionID, body)
+      if (generation && currentSession(sessionID, generation)) rememberStableInstructions(providerID, sessionID, body)
       return baseFetch(routedRequestInput, routedRequestInit)
     }) as FetchLike
 
@@ -1891,49 +2028,43 @@ export function createCompactHooks(
 
   async function handleEvent(event: AnyRecord) {
     if (disposed) return
-    if (event.type === "session.compacted") {
-      const sessionID = asRecord(event.properties)?.sessionID
-      if (typeof sessionID !== "string") return
-      const nativeCompaction = pendingNativeCompactions.get(sessionID)
-      if (!nativeCompaction?.completed || !currentNativeCompaction(sessionID, nativeCompaction)) return
-      // This event has no operation ID. Confirm completion of our own summary before clearing anything.
-      const raw = await options.getSessionMessages?.(sessionID).catch(() => undefined)
-      if (!currentNativeCompaction(sessionID, nativeCompaction) || !Array.isArray(raw) || !raw.some((message) =>
-        message.info?.id === nativeCompaction.summaryID &&
-        message.info?.parentID === nativeCompaction.compactionMessageID && isCompletedCompactionSummary(message.info))) return
-
-      clearNativeFallbackSession(sessionID)
+    const properties = asRecord(event.properties)
+    const sessionID = properties?.sessionID
+    if (typeof sessionID !== "string" || sessionGeneration(sessionID).deleted) return
+    const statusType = asRecord(properties?.status)?.type
+    if (event.type === "session.status" && (statusType === "busy" || statusType === "retry")) {
+      sessionGeneration(sessionID).activity++
+      return
+    }
+    if (event.type === "session.compacted" || event.type === "session.idle" || event.type === "session.error" ||
+      (event.type === "session.status" && statusType === "idle")) {
+      await refreshCompactionOwner(sessionID)
       return
     }
 
     if (event.type === "message.updated") {
-      const properties = asRecord(event.properties)
-      const sessionID = properties?.sessionID
-      if (typeof sessionID !== "string") return
-      const nativeCompaction = pendingNativeCompactions.get(sessionID)
-      const info = asRecord(properties?.info)
-      if (!nativeCompaction?.completed || !currentNativeCompaction(sessionID, nativeCompaction) ||
-        !isCompletedCompactionSummary(info)) return
-      if (info?.id !== nativeCompaction.summaryID || info.parentID !== nativeCompaction.compactionMessageID) return
+      const capture = compactionCaptures.get(sessionID)
+      if (capture?.binding) finishCapture(capture, properties?.info)
+      else if (capture && terminalCaptureSummary(capture, properties?.info)) await refreshCompactionOwner(sessionID)
+      return
+    }
 
-      clearNativeFallbackSession(sessionID)
+    if (event.type === "session.updated") {
+      const info = asRecord(properties?.info)
+      if (info?.id !== sessionID) return
+      const revert = asRecord(info.revert)
+      const key = typeof revert?.messageID === "string" ? JSON.stringify([revert.messageID, revert.partID]) : undefined
+      if (sessionGeneration(sessionID).revert !== key) invalidateSession(sessionID).revert = key
       return
     }
 
     if (event.type === "session.deleted") {
-      const sessionID = asRecord(event.properties)?.sessionID
-      if (typeof sessionID !== "string") return
-      invalidateCompactOperations(sessionID)
+      invalidateSession(sessionID, true)
       for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
-      pendingCompactResults.delete(sessionID)
-      pendingAutoContinues.delete(sessionID)
-      pendingAutoContinueRequests.delete(sessionID)
-      pendingNativeCompactions.delete(sessionID)
       for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
       for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
       for (const sessions of stableInstructionsByProvider.values()) sessions.delete(sessionID)
       for (const sessions of pendingSystemByProvider.values()) sessions.delete(sessionID)
-      clearStructuredCapture(sessionID)
       for (const key of providerByMessage.keys()) {
         if (key.startsWith(`${sessionID}\0`)) providerByMessage.delete(key)
       }
@@ -1942,24 +2073,11 @@ export function createCompactHooks(
     }
 
     if (event.type === "message.removed") {
-      const properties = asRecord(event.properties)
-      const sessionID = properties?.sessionID
       const messageID = properties?.messageID
-      if (typeof sessionID !== "string" || typeof messageID !== "string") return
+      if (typeof messageID !== "string") return
 
       providerByMessage.delete(messageProviderKey(sessionID, messageID))
-      invalidateCompactOperations(sessionID)
-      clearStructuredCapture(sessionID)
-      pendingAutoContinues.delete(sessionID)
-      pendingAutoContinueRequests.delete(sessionID)
-      const nativeCompaction = pendingNativeCompactions.get(sessionID)
-      if (
-        nativeCompaction &&
-        (nativeCompaction.checkpoint.afterMessageID === messageID ||
-          nativeCompaction.compactionMessageID === messageID)
-      ) {
-        pendingNativeCompactions.delete(sessionID)
-      }
+      invalidateSession(sessionID)
       forgetControlMessage(sessionID, messageID)
       for (const [providerID, sessions] of checkpointsByProvider) {
         const checkpoints = sessions.get(sessionID)
@@ -1978,14 +2096,6 @@ export function createCompactHooks(
       }
       return
     }
-
-    const compact = compactCheckpointFromEvent(event)
-    if (!compact) return
-    const pending = pendingCompactResults.get(compact.sessionID)
-    if (pending?.responseID !== compact.responseID) return
-    pendingCompactResults.delete(compact.sessionID)
-    const checkpoint = addCheckpoint(compact.providerID, compact.sessionID, compact.responseID, compact.boundary, pending.items)
-    getProviderSessionMap(activeCheckpointByProvider, compact.providerID).set(compact.sessionID, checkpoint)
   }
 
   const hooks: Hooks = {
@@ -2007,11 +2117,17 @@ export function createCompactHooks(
 
     async dispose() {
       disposed = true
-      for (const sessions of compactOperationsByProvider.values()) {
-        for (const sessionID of sessions.keys()) invalidateCompactOperations(sessionID)
-      }
+      for (const sessionID of sessionGenerations.keys()) invalidateSession(sessionID)
       compactOperationsByProvider.clear()
       compactionCaptures.clear()
+      compactionOwners.clear()
+      sessionGenerations.clear()
+      for (const map of [checkpointsByProvider, activeCheckpointByProvider, controlMessagesByProvider,
+        stableInstructionsByProvider, pendingSystemByProvider]) map.clear()
+      pendingNativeCompactions.clear()
+      pendingAutoContinues.clear()
+      pendingAutoContinueRequests.clear()
+      providerByMessage.clear()
       store.close()
     },
 
@@ -2039,10 +2155,8 @@ export function createCompactHooks(
     "chat.message": async (input, output) => {
       if (disposed) return
       if (typeof input.sessionID === "string") {
-        invalidateCompactOperations(input.sessionID)
-        clearStructuredCapture(input.sessionID)
-        pendingAutoContinues.delete(input.sessionID)
-        pendingAutoContinueRequests.delete(input.sessionID)
+        if (sessionGeneration(input.sessionID).deleted) return
+        invalidateSession(input.sessionID)
         const message = asRecord(output.message)
         const messageID = typeof input.messageID === "string" ? input.messageID : message?.id
         if (typeof messageID === "string") forgetControlMessage(input.sessionID, messageID)
@@ -2054,17 +2168,19 @@ export function createCompactHooks(
       const providerID = getProviderID(input)
       if (!providerID || typeof input.sessionID !== "string" || disposed) return
       const sessionID = input.sessionID
+      const generation = sessionGeneration(sessionID)
+      if (!currentSession(sessionID, generation)) return
       const capture = compactionCaptures.get(sessionID)
       const modelID = asRecord(input.model)?.id
       if (capture && typeof modelID === "string" && modelID && typeof input.agent === "string" && input.agent &&
         currentCapture(capture) && matchesCaptureMessage(capture, input.message)) {
         if ((capture.phase === "pending" || capture.phase === "ready") && options.getSessionMessages) {
-          const raw = await options.getSessionMessages(sessionID).catch(() => undefined)
+          const raw = await readSessionMessages(sessionID)
           if (!currentCapture(capture)) return
           if (capture.phase === "pending" || capture.phase === "ready") {
             // The summary is persisted AFTER messages.transform. Only verify the frozen boundary here;
             // never adopt a newer boundary from this second read (including utility requests).
-            const boundary = Array.isArray(raw) ? compactionBoundaryFrom(raw, sessionID) : undefined
+            const boundary = Array.isArray(raw) ? compactionBoundaryFrom(raw, sessionID, capture.boundary) : undefined
             const summaries = boundary?.messageID === capture.boundary!.messageID &&
               boundary.createdAt === capture.boundary!.createdAt
               ? (raw as MessageEntry[]).filter(({ info }) => info?.role === "assistant" && info.summary === true &&
@@ -2073,9 +2189,12 @@ export function createCompactHooks(
               : []
             const summary = summaries.length === 1 ? summaries[0].info : undefined
             if (summary?.providerID === providerID && summary.modelID === modelID && summary.agent === input.agent) {
-              capture.binding = { providerID, modelID, agent: input.agent }
-              if (!configuredProviders.has(providerID)) releaseCapture(capture, "ignored")
-              else {
+              capture.generation.activity++
+              capture.binding = { providerID, modelID, agent: input.agent, summaryID: summary.id! }
+              if (!configuredProviders.has(providerID)) {
+                releaseCapture(capture, "ignored")
+                compactionOwners.delete(sessionID)
+              } else {
                 // Choose the target provider's checkpoint, not the history provider's checkpoint.
                 const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID) ??
                   checkpointsByProvider.get(providerID)?.get(sessionID)?.at(-1)
@@ -2153,22 +2272,23 @@ export function createCompactHooks(
       const messages = output.messages as unknown as MessageEntry[]
       const sessionID = sessionIDFromMessages(messages)
       if (!sessionID || disposed) return
+      let generation = sessionGeneration(sessionID)
+      if (!currentSession(sessionID, generation)) return
       const capture = compactionCaptures.get(sessionID)
       if (messages.some((message) => message.info?.sessionID !== sessionID)) {
         // Do not let an ambiguous transform modify either session's history.
         return
       }
       if (capture?.boundary && currentCapture(capture) && messages.some((message) =>
-        message.info?.role === "user" && isAfterBoundary(message.info, capture.boundary!))) {
-        invalidateCompactOperations(sessionID)
-        clearStructuredCapture(sessionID)
+        message.info?.role === "user" && isAfterBoundary(message.info, capture.boundary!) && !isCompactionUser(message))) {
+        generation = invalidateSession(sessionID)
       }
       const capturing = capture?.phase === "pending" && currentCapture(capture)
       const capturePhase = capture?.phase
       const providerID = providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
       if (providerID && configuredProviders.has(providerID)) {
         await inheritForkState(providerID, sessionID, messages, capture)
-        if (disposed || compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return
+        if (!currentSession(sessionID, generation) || compactionCaptures.get(sessionID) !== capture || capture?.phase !== capturePhase) return
         if (capturing && !activeCheckpointByProvider.get(providerID)?.has(sessionID)) {
           const checkpoint = checkpointsByProvider.get(providerID)?.get(sessionID)?.at(-1)
           if (checkpoint) getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
@@ -2198,32 +2318,45 @@ export function createCompactHooks(
     "experimental.chat.system.transform": async (input, output) => {
       const providerID = getProviderID(input)
       if (!providerID || !configuredProviders.has(providerID)) return
-      if (typeof input.sessionID !== "string") return
+      if (typeof input.sessionID !== "string" || disposed || sessionGeneration(input.sessionID).deleted) return
       rememberPendingSystem(providerID, input.sessionID, output.system)
     },
 
     "experimental.session.compacting": async (input) => {
       if (typeof input.sessionID !== "string" || disposed) return
-      invalidateCompactOperations(input.sessionID)
-      clearStructuredCapture(input.sessionID)
-      pendingAutoContinues.delete(input.sessionID)
-      pendingAutoContinueRequests.delete(input.sessionID)
-      pendingNativeCompactions.delete(input.sessionID)
-      const capture: CompactionCapture = {
-        id: randomUUID(), sessionID: input.sessionID, createdAt: Date.now(), phase: "pending",
+      const sessionID = input.sessionID
+      const observed = sessionGeneration(sessionID)
+      if (!currentSession(sessionID, observed)) throw new Error(compactInvalidMessage)
+      if (compactionOwners.has(sessionID)) {
+        const checked = await refreshCompactionOwner(sessionID)
+        if (!checked && currentSession(sessionID, observed) && compactionOwners.has(sessionID)) throw new Error(compactBusyMessage)
+        if (!checked || !currentSession(sessionID, checked)) throw new Error(compactInvalidMessage)
+        if (compactionOwners.has(sessionID)) throw new Error(compactBusyMessage)
       }
-      compactionCaptures.set(input.sessionID, capture)
-      const raw = await options.getSessionMessages?.(input.sessionID).catch(() => undefined)
-      if (!currentCapture(capture) || !Array.isArray(raw)) return
-      capture.boundary = compactionBoundaryFrom(raw, input.sessionID)
-      if (!capture.boundary) return
-      capture.rawMessages = raw
-      capture.priorSummaryIDs = new Set(raw.flatMap((message: MessageEntry) =>
+      const generation = invalidateSession(sessionID)
+      const capture: CompactionCapture = {
+        id: randomUUID(), sessionID, createdAt: Date.now(), phase: "pending", generation,
+        controller: new AbortController(),
+      }
+      compactionCaptures.set(sessionID, capture)
+      compactionOwners.set(sessionID, capture.id)
+      const raw = await readSessionMessages(sessionID)
+      if (!currentCapture(capture)) return
+      capture.boundary = Array.isArray(raw) ? compactionBoundaryFrom(raw, sessionID) : undefined
+      if (!capture.boundary) {
+        // Release the lease, but keep the pending transform marker so an unbound
+        // native compaction is not trimmed using a plugin checkpoint.
+        compactionOwners.delete(sessionID)
+        return
+      }
+      capture.rawMessages = raw as MessageEntry[]
+      capture.priorSummaryIDs = new Set((raw as MessageEntry[]).flatMap((message: MessageEntry) =>
         message.info?.summary && typeof message.info.id === "string" ? [message.info.id] : []))
     },
 
     "experimental.compaction.autocontinue": async (input) => {
       if (typeof input.sessionID !== "string" || disposed) return
+      if (sessionGeneration(input.sessionID).deleted) return
       const capture = compactionCaptures.get(input.sessionID)
       if (capture) {
         if (!currentCapture(capture) || !matchesCaptureMessage(capture, input.message)) return
@@ -2231,29 +2364,19 @@ export function createCompactHooks(
         releaseCapture(capture, capture.phase === "pending" || capture.phase === "ready" ? "ignored" : capture.phase)
         // Native compaction on an unsupported target must not arm continuation filtering
         // for a configured source provider's next ordinary request.
-        if (capture.phase === "ignored") return
+        if (capture.phase === "ignored") {
+          if (compactionOwners.get(input.sessionID) === capture.id) compactionOwners.delete(input.sessionID)
+          return
+        }
       }
+      // Legacy responses have no verifiable OpenCode parent. Their late callbacks must
+      // neither move a boundary nor arm filtering for a later, genuine user request.
+      if (!capture && [...compactOperationsByProvider.values()].some((sessions) => sessions.has(input.sessionID))) return
       const providerID = getProviderID(input)
       if (!providerID || !configuredProviders.has(providerID)) return
-      const pending = pendingCompactResults.get(input.sessionID)
       const message = asRecord(input.message)
       const messageID = message?.id
       const createdAt = asRecord(message?.time)?.created
-      if (
-        pending?.providerID === providerID &&
-        typeof messageID === "string" &&
-        finiteNumber(createdAt)
-      ) {
-        pendingCompactResults.delete(input.sessionID)
-        const checkpoint = addCheckpoint(
-          providerID,
-          input.sessionID,
-          pending.responseID,
-          { messageID, createdAt },
-          pending.items,
-        )
-        getProviderSessionMap(activeCheckpointByProvider, providerID).set(input.sessionID, checkpoint)
-      }
       pendingAutoContinueRequests.delete(input.sessionID)
       pendingAutoContinues.set(input.sessionID, {
         providerID,

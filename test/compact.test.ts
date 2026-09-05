@@ -1145,23 +1145,7 @@ describe("OpenAI compact hooks", () => {
       })
       expect(store.count()).toBe(1)
 
-      await hooks.event?.({
-        event: {
-          type: "message.updated",
-          properties: {
-            sessionID,
-            info: {
-              id: "msg_native_summary",
-              sessionID,
-              role: "assistant",
-              parentID: "msg_native_compaction",
-              summary: true,
-              finish: "stop",
-              time: { created: now + 4, completed: now + 5 },
-            },
-          },
-        } as any,
-      })
+      await fixture.finish(hooks, sessionID)
       expect(store.count()).toBe(0)
       expect(store.loadControlMessages()).toEqual([])
 
@@ -1331,6 +1315,7 @@ describe("OpenAI compact hooks", () => {
         { role: "user", content: "after first plugin checkpoint" },
       ])
 
+      await fixture.finish(hooks, sessionID)
       const secondTail = {
         info: {
           id: "msg_after_first_plugin_checkpoint",
@@ -2412,17 +2397,24 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+      const headers = await fixture.capture(hooks, {
+        sessionID: "ses_request", model: { id: "ignored" },
+        boundary: { id: "msg_checkpoint", time: { created: 2 } },
+        history: [{
+          info: { id: "msg_original", sessionID: "ses_request", role: "user", time: { created: 1 } },
+          parts: [{ type: "text", text: "hello" }],
+        }],
+      })
+      const hello = { role: "user", content: [{ type: "input_text", text: "hello" }] }
 
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: "ses_request",
-        },
+        headers,
         body: JSON.stringify({
           model: "ignored",
           instructions: compactionInstructions,
@@ -2434,7 +2426,7 @@ describe("OpenAI compact hooks", () => {
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: "ignored",
-        input: [{ role: "user", content: "hello" }, { type: "compaction_trigger" }],
+        input: [hello, { type: "compaction_trigger" }],
         tool_choice: "auto",
         store: false,
         stream: true,
@@ -2443,20 +2435,16 @@ describe("OpenAI compact hooks", () => {
       expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.compact)).toBe(false)
       expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.session)).toBe(false)
 
-      const messagesBeforeBoundaryEvent = [
-        {
-          info: {
-            id: "msg_original", sessionID: "ses_request", role: "user",
-            model: { providerID: "openai", modelID: "gpt" }, time: { created: 1 },
-          },
-          parts: [],
+      await fixture.finish(hooks, "ses_request")
+      const boundaryMessages = [{
+        info: {
+          id: "msg_checkpoint", sessionID: "ses_request", role: "user",
+          model: { providerID: "openai", modelID: "gpt" }, time: { created: 2 },
         },
-      ]
-      await hooks["experimental.chat.messages.transform"]?.(
-        {},
-        { messages: messagesBeforeBoundaryEvent } as any,
-      )
-      expect(messagesBeforeBoundaryEvent).toHaveLength(1)
+        parts: [{ type: "compaction" }],
+      }]
+      await hooks["experimental.chat.messages.transform"]?.({}, { messages: boundaryMessages } as any)
+      expect(boundaryMessages).toHaveLength(0)
 
       calls.length = 0
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
@@ -2487,7 +2475,7 @@ describe("OpenAI compact hooks", () => {
       const followupBody = jsonBody(calls[0]?.init)
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(followupBody.input).toEqual([
-        { role: "user", content: "hello" },
+        hello,
         {
           id: "cmp_compacted",
           type: "compaction",
@@ -2533,12 +2521,17 @@ describe("OpenAI compact hooks", () => {
       expect(inferredProviderMessages.map((message) => message.info.id)).toEqual(["msg_after"])
 
       calls.length = 0
+      const nextHeaders = await fixture.capture(hooks, {
+        sessionID: "ses_request", model: { id: "ignored" },
+        boundary: { id: "msg_next_checkpoint", time: { created: 4 } },
+        history: [{
+          info: { id: "msg_after", sessionID: "ses_request", role: "user", time: { created: 3 } },
+          parts: [{ type: "text", text: "after compact" }],
+        }],
+      })
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: "ses_request",
-        },
+        headers: nextHeaders,
         body: JSON.stringify({
           model: "ignored",
           input: [
@@ -2555,14 +2548,14 @@ describe("OpenAI compact hooks", () => {
       expect(jsonBody(calls[0]?.init).input).toEqual([
         { role: "developer", content: "stable instructions" },
         { role: "system", content: "more stable instructions" },
-        { role: "user", content: "hello" },
+        hello,
         {
           id: "cmp_compacted",
           type: "compaction",
           encrypted_content: "compacted",
           internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
         },
-        { role: "user", content: "after compact" },
+        { role: "user", content: [{ type: "input_text", text: "after compact" }] },
         { type: "compaction_trigger" },
       ])
     } finally {
@@ -3239,33 +3232,29 @@ describe("OpenAI compact hooks", () => {
     }) as typeof fetch
 
     try {
-      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const fixture = compactionFixture()
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, { getSessionMessages: fixture.getSessionMessages })
       const cfg: any = {}
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+      const headers = await fixture.capture(hooks, {
+        sessionID: "ses_undo", boundary: { id: "msg_checkpoint", time: { created: 2 } },
+        history: [{
+          info: { id: "msg_before", sessionID: "ses_undo", role: "user", time: { created: 1 } },
+          parts: [{ type: "text", text: "before compact" }],
+        }],
+      })
 
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
-        headers: {
-          [defaultConfig.headers.compact]: "1",
-          [defaultConfig.headers.session]: "ses_undo",
-        },
+        headers,
         body: JSON.stringify({
           model: "ignored",
           instructions: compactionInstructions,
           input: [{ role: "user", content: "before compact" }],
         }),
       })
-      await hooks.event?.({
-        event: {
-          type: "message.part.updated",
-          properties: {
-            sessionID: "ses_undo",
-            part: { messageID: "msg_checkpoint", type: "text", text: defaultConfig.summary },
-            time: 2,
-          },
-        } as any,
-      })
+      await fixture.finish(hooks, "ses_undo")
       expect(store.count()).toBe(1)
 
       await hooks.event?.({
@@ -3287,7 +3276,7 @@ describe("OpenAI compact hooks", () => {
         body: JSON.stringify({ model: "gpt", input: [{ role: "user", content: "after redo" }] }),
       })
       expect(jsonBody(calls[0]?.init).input).toEqual([
-        { role: "user", content: "before compact" },
+        { role: "user", content: [{ type: "input_text", text: "before compact" }] },
         { type: "compaction", encrypted_content: "undo-compacted" },
         { role: "user", content: "after redo" },
       ])
