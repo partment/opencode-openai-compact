@@ -91,8 +91,12 @@ export const OpenAICompactConfigSchema = z
     summary: z.string().min(1).default(defaultCompactSummary),
     state: z
       .object({
-        retentionDays: z.number().int().positive().default(defaultState.retentionDays),
-        deleteOnSessionDeleted: z.boolean().default(defaultState.deleteOnSessionDeleted),
+        retentionDays: z.number().int().positive()
+          .describe("Global database retention policy; non-global config overrides are ignored")
+          .default(defaultState.retentionDays),
+        deleteOnSessionDeleted: z.boolean()
+          .describe("Retain deleted-session rows when false, but never keep using them")
+          .default(defaultState.deleteOnSessionDeleted),
       })
       .default(defaultState),
   })

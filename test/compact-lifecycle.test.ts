@@ -273,7 +273,7 @@ describe("session compaction lifecycle", () => {
       const before = f.store.loadAll()
       const controls = f.store.loadControlMessages()
       const a = await f.begin()
-      const upsert = vi.spyOn(f.store, "upsert")
+      const upsert = vi.spyOn(f.store, "commitCheckpoint")
       f.network.mockImplementationOnce(async () => { started.resolve(); return gate.promise })
       const pending = f.send(a.headers)
       await started.promise
@@ -300,7 +300,7 @@ describe("session compaction lifecycle", () => {
     let disposed = false
     try {
       const a = await f.begin()
-      const upsert = vi.spyOn(f.store, "upsert")
+      const upsert = vi.spyOn(f.store, "commitCheckpoint")
       f.network.mockImplementationOnce(async () => new Response(new ReadableStream({
         start(value) { controller = value; started.resolve() },
       })))
@@ -437,7 +437,7 @@ describe("session compaction lifecycle", () => {
       await f.fixture.cancel(f.hooks, sessionID)
       const b = await f.begin()
       f.network.mockResolvedValueOnce(completed("resp_B"))
-      const upsert = vi.spyOn(f.store, "upsert")
+      const upsert = vi.spyOn(f.store, "commitCheckpoint")
       if (order === "B-first") expect((await f.send(b.headers)).status).toBe(200)
       gate.resolve(completed("resp_late_A"))
       expect((await pending).status).toBe(400)
@@ -547,7 +547,7 @@ describe("session compaction lifecycle", () => {
     const f = await setup()
     try {
       const headers = { [f.config.headers.session]: sessionID, [f.config.headers.compact]: "1" }
-      const upsert = vi.spyOn(f.store, "upsert")
+      const upsert = vi.spyOn(f.store, "commitCheckpoint")
       await f.send(headers)
       const first = f.store.loadAll()[0].checkpoint
       expect(first.afterMessageID).toMatch(/^msg_compact_/)
@@ -616,8 +616,7 @@ describe("session compaction lifecycle", () => {
         const cfg: any = {}
         await hooks.config?.(cfg)
         const messages = history("child")
-        const upsert = vi.spyOn(store, "upsert")
-        const control = vi.spyOn(store, "upsertControlMessage")
+        const commit = vi.spyOn(store, "commitForkState")
         const pending = hooks["experimental.chat.messages.transform"]!({}, { messages } as any)
         await started.promise
         if (action.includes("delete")) await hooks.event?.({ event: {
@@ -643,8 +642,7 @@ describe("session compaction lifecycle", () => {
           expect(store.loadControlMessages().some((item) => item.sessionID === "child")).toBe(true)
           expect(messages).toEqual([])
         } else {
-          expect(upsert).not.toHaveBeenCalled()
-          expect(control).not.toHaveBeenCalled()
+          expect(commit).not.toHaveBeenCalled()
           expect(messages).toEqual(history("child"))
           if (!disposed) {
             const response = await cfg.provider.openai.options.fetch(url, {

@@ -84,6 +84,8 @@ Read order:
 3. Directory from `OPENCODE_CONFIG_DIR`: `openai-compact.json`, then `openai-compact.jsonc`.
 4. Nearest project `.opencode` directory found by walking upward from the current directory: `openai-compact.json`, then `openai-compact.jsonc`.
 
+Exception: `state.retentionDays` is read only from layer 2 because all projects share one global database. Values in layers 3 and 4 are ignored with a warning.
+
 Global OpenCode config directory:
 
 - `$XDG_CONFIG_HOME/opencode`, when `XDG_CONFIG_HOME` is set.
@@ -103,7 +105,7 @@ The database stores checkpoints and the message IDs of OpenCode's internal post-
 
 When a forked OpenCode session first runs after compaction, checkpoints and control turns before the fork point are copied to the new session with their regenerated message IDs.
 
-The default retention is 30 days. Checkpoints and control-message records are deleted when OpenCode emits `session.deleted`.
+The default retention is 30 days. Retention is a global maintenance policy for this shared database, not a per-project setting. Set `state.retentionDays` only in the fixed global OpenCode config directory. Values from `OPENCODE_CONFIG_DIR` or project `.opencode` files are ignored with a warning so one project cannot prune another project's checkpoints.
 
 ## Example Configuration
 
@@ -183,8 +185,8 @@ The default retention is 30 days. Checkpoints and control-message records are de
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `retentionDays` | `integer` | `30` | Number of days to keep checkpoints. |
-| `deleteOnSessionDeleted` | `boolean` | `true` | Deletes checkpoints when OpenCode emits `session.deleted`. |
+| `retentionDays` | `integer` | `30` | Global number of days to keep checkpoints in the shared database. Only the fixed global config directory may override it; non-global values are ignored with a warning. |
+| `deleteOnSessionDeleted` | `boolean` | `true` | Deletes stored rows on `session.deleted`. When `false`, rows remain but are tombstoned and never used again. |
 
 ## Star Us On GitHub
 

@@ -116,12 +116,12 @@
           "type": "integer",
           "minimum": 1,
           "default": 30,
-          "description": "Number of days to keep compaction checkpoints."
+          "description": "Global retention policy for the shared checkpoint database. Only the fixed global OpenCode config directory may set this value; non-global overrides are ignored with a warning."
         },
         "deleteOnSessionDeleted": {
           "type": "boolean",
           "default": true,
-          "description": "Deletes checkpoints for a session when OpenCode emits session.deleted."
+          "description": "Deletes stored rows when OpenCode emits session.deleted. When false, rows remain for retention purposes but are tombstoned and never used again."
         }
       }
     }

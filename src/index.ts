@@ -9,25 +9,30 @@ export const server: Plugin = async ({ client, directory, worktree }) => {
   if (!config.enabled) return {}
 
   const store = await CheckpointStore.open(getDatabasePath())
-  store.prune(config.state.retentionDays)
+  try {
+    store.prune(config.state.retentionDays)
 
-  return createCompactHooks(config, store, fetch, {
-    async getSessionMessages(sessionID) {
-      const result = await client.session.messages({ path: { id: sessionID } })
-      return result.data
-    },
-    async getSessionStatus(sessionID) {
-      const result = await client.session.status()
-      const statuses = result.data
-      if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) return undefined
-      if (Object.values(statuses).some((status) => !status || Array.isArray(status) ||
-        (status.type !== "idle" && status.type !== "busy" && status.type !== "retry"))) return undefined
-      return Object.hasOwn(statuses, sessionID) ? statuses[sessionID].type : "idle"
-    },
-    async setOpenAIAuth(auth) {
-      await client.auth.set({ path: { id: "openai" }, body: auth as any })
-    },
-  })
+    return createCompactHooks(config, store, fetch, {
+      async getSessionMessages(sessionID) {
+        const result = await client.session.messages({ path: { id: sessionID } })
+        return result.data
+      },
+      async getSessionStatus(sessionID) {
+        const result = await client.session.status()
+        const statuses = result.data
+        if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) return undefined
+        if (Object.values(statuses).some((status) => !status || Array.isArray(status) ||
+          (status.type !== "idle" && status.type !== "busy" && status.type !== "retry"))) return undefined
+        return Object.hasOwn(statuses, sessionID) ? statuses[sessionID].type : "idle"
+      },
+      async setOpenAIAuth(auth) {
+        await client.auth.set({ path: { id: "openai" }, body: auth as any })
+      },
+    })
+  } catch (error) {
+    store.close()
+    throw error
+  }
 }
 
 export default {

@@ -74,6 +74,34 @@ describe("resolveSQLiteBinding", () => {
 })
 
 describe("openSQLiteDatabase", () => {
+  test("commits and rolls back adapted transactions", () => {
+    class TransactionDatabase {
+      static last: TransactionDatabase | undefined
+      execs: string[] = []
+      constructor() { TransactionDatabase.last = this }
+      exec(sql: string) {
+        this.execs.push(sql)
+        if (sql === "fail") throw new Error("transaction failed")
+      }
+      prepare() { return { get: () => null, all: () => [], run: () => undefined } }
+      close() {}
+    }
+    const db = openSQLiteDatabase("transaction.sqlite", {
+      isBun: false,
+      require(id) {
+        if (id === "node:sqlite") return { DatabaseSync: TransactionDatabase }
+        throw new Error(`unexpected ${id}`)
+      },
+    })
+
+    expect(db.transaction(() => { db.exec("work"); return "done" })).toBe("done")
+    expect(() => db.transaction(() => db.exec("fail"))).toThrow("transaction failed")
+    expect(TransactionDatabase.last?.execs).toEqual([
+      "BEGIN IMMEDIATE", "work", "COMMIT",
+      "BEGIN IMMEDIATE", "fail", "ROLLBACK",
+    ])
+  })
+
   test("adapts prepare-based sqlite APIs", () => {
     class PrepareDatabase {
       static last: PrepareDatabase | undefined

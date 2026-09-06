@@ -11,6 +11,7 @@ export type SQLiteStatement<T = Record<string, unknown>> = {
 export type SQLiteDatabase = {
   exec(sql: string): unknown
   query<T = Record<string, unknown>>(sql: string): SQLiteStatement<T>
+  transaction<T>(run: () => T): T
   close(): void
 }
 
@@ -118,6 +119,23 @@ function adaptSQLiteDatabase(db: RawDatabase): SQLiteDatabase {
         run(...params) {
           return statement.run(...params)
         },
+      }
+    },
+    transaction<T>(run: () => T) {
+      let began = false
+      try {
+        db.exec("BEGIN IMMEDIATE")
+        began = true
+        const result = run()
+        db.exec("COMMIT")
+        began = false
+        return result
+      } catch (error) {
+        if (began) {
+          try { db.exec("ROLLBACK") }
+          catch { /* Preserve the original transaction error. */ }
+        }
+        throw error
       }
     },
     close() {

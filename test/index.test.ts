@@ -14,6 +14,32 @@ beforeEach(() => {
   vi.mocked(loadConfig).mockResolvedValue(defaultConfig)
 })
 
+describe("plugin store lifecycle", () => {
+  test("prunes once before handing the store to hooks", async () => {
+    const store = CheckpointStore.openMemory()
+    const open = vi.spyOn(CheckpointStore, "open").mockResolvedValue(store)
+    const prune = vi.spyOn(store, "prune")
+    try {
+      await server({ client: { session: { status: async () => ({ data: {} }) } }, directory: ".", worktree: "." } as any)
+      expect(prune).toHaveBeenCalledOnce()
+      expect(prune).toHaveBeenCalledWith(defaultConfig.state.retentionDays)
+      expect(createCompactHooks).toHaveBeenCalledOnce()
+    } finally { open.mockRestore(); store.close() }
+  })
+
+  test.each(["prune", "hooks"])("closes the store when %s initialization fails", async (failure) => {
+    const store = CheckpointStore.openMemory()
+    const open = vi.spyOn(CheckpointStore, "open").mockResolvedValue(store)
+    const close = vi.spyOn(store, "close").mockImplementation(() => {})
+    if (failure === "prune") vi.spyOn(store, "prune").mockImplementation(() => { throw new Error("prune failed") })
+    else vi.mocked(createCompactHooks).mockImplementationOnce(() => { throw new Error("hooks failed") })
+    try {
+      await expect(server({ client: { session: {} }, directory: ".", worktree: "." } as any)).rejects.toThrow(`${failure} failed`)
+      expect(close).toHaveBeenCalledOnce()
+    } finally { open.mockRestore(); close.mockRestore(); store.close() }
+  })
+})
+
 describe("session status SDK adapter", () => {
   test.each([
     ["busy", { data: { ses_test: { type: "busy" } } }, "busy"],

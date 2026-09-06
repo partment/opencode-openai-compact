@@ -31,6 +31,29 @@ async function readOptionalJsonc(source: ConfigSource) {
   return parsed ?? {}
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function configPathIdentity(file: string) {
+  const resolved = path.resolve(file)
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved
+}
+
+function withoutNonGlobalRetention(data: unknown, source: ConfigSource, globalPaths: Set<string>) {
+  if (globalPaths.has(configPathIdentity(source.path))) return data
+  const root = asRecord(data)
+  const state = asRecord(root?.state)
+  if (!root || !state || !Object.hasOwn(state, "retentionDays")) return data
+
+  console.warn(
+    `opencode-openai-compact: ignoring state.retentionDays in ${source.path}; ` +
+      `retention is a global database policy. Move it to ${getDefaultConfigPath()}.`,
+  )
+  const { retentionDays: _ignored, ...remainingState } = state
+  return { ...root, state: remainingState }
+}
+
 async function fileExists(file: string) {
   try {
     await fs.stat(file)
@@ -66,10 +89,11 @@ export async function loadConfig(context: ConfigContext): Promise<OpenAICompactC
   await ensureGlobalConfigFile()
 
   let merged: unknown = defaultConfig
+  const globalPaths = new Set(getGlobalConfigSources().map((source) => configPathIdentity(source.path)))
   for (const source of getConfigSources(context)) {
     const data = await readOptionalJsonc(source)
     if (data === undefined) continue
-    merged = mergeDeep(merged, data)
+    merged = mergeDeep(merged, withoutNonGlobalRetention(data, source, globalPaths))
   }
 
   return OpenAICompactConfigSchema.parse(merged)

@@ -290,7 +290,7 @@ describe("immutable compaction retries", () => {
     const network = vi.fn(async () => { started.resolve(); return gate.promise })
     const f = await retrySession(network as typeof fetch)
     try {
-      const upsert = vi.spyOn(f.store, "upsert")
+      const upsert = vi.spyOn(f.store, "commitCheckpoint")
       const first = f.fetch(url, f.init)
       await started.promise
       const second = f.fetch(url, { ...f.init, signal: new AbortController().signal })
@@ -317,7 +317,7 @@ describe("immutable compaction retries", () => {
       const f = await retrySession(network as typeof fetch)
       let closed = false
       try {
-        const upsert = vi.spyOn(f.store, "upsert")
+        const upsert = vi.spyOn(f.store, "commitCheckpoint")
         const pending = f.fetch(url, f.init)
         await started.promise
         let nextHeaders: Record<string, string> | undefined

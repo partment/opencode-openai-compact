@@ -397,8 +397,8 @@ describe("identity-only control filtering", () => {
       const history = [message("control", continuation), message("real", "new question")]
       const gate = deferred<unknown>()
       const started = deferred<void>()
-      const upsert = vi.spyOn(f.store, "upsertControlMessage")
-      const checkpoint = vi.spyOn(f.store, "upsert")
+      const upsert = vi.spyOn(f.store, "commitControlMessages")
+      const checkpoint = vi.spyOn(f.store, "commitForkState")
       f.read.mockImplementationOnce(async () => { started.resolve(); return gate.promise })
       let disposed = false
       try {
@@ -472,8 +472,8 @@ describe("identity-only control filtering", () => {
     })
     try {
       const messages = structuredClone(histories.get(sessionID)!)
-      const upsert = vi.spyOn(f.store, "upsert")
-      const controlWrite = vi.spyOn(f.store, "upsertControlMessage")
+      const upsert = vi.spyOn(f.store, "commitForkState")
+      const controlWrite = vi.spyOn(f.store, "commitControlMessages")
       const pending = hooks["experimental.chat.messages.transform"]!({}, { messages } as any)
       await started.promise
       first.resolve(histories.get("one"))
