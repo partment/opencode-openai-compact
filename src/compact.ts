@@ -111,6 +111,8 @@ type CompactionCapture = {
 type PreparedCompactRequest = {
   body: string
   fallbackBody?: string
+  fallbackCheckpointInput?: unknown[]
+  checkpointInput?: unknown[]
   target: string
   model: string
   summary: string
@@ -231,10 +233,49 @@ export function isResponsesUrl(url: URL, config: OpenAICompactConfig) {
   return pathWithoutTrailingSlash(url.pathname).endsWith(config.responses.endpointPath)
 }
 
-function requestHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {
-  const headers = new Headers(input instanceof Request ? input.headers : undefined)
-  new Headers(init?.headers).forEach((value, key) => headers.set(key, value))
-  return headers
+type RequestInitWithDuplex = RequestInit & { duplex?: "half" }
+type RequestBody = BodyInit | null | undefined
+type NormalizedFetchRequest = {
+  input: RequestInfo | URL
+  request: Request
+  url: URL
+  method: string
+  headers: Headers
+  forwardBody: RequestBody
+  bodyText?: string
+  body?: AnyRecord
+}
+
+type RequestWithDuplex = Request & { duplex?: "half" }
+
+function requestWithFetchSemantics(input: RequestInfo | URL, init?: RequestInit): Request {
+  const source = input instanceof Request && !input.bodyUsed ? input.clone() : input
+  const duplex = (init as RequestInitWithDuplex | undefined)?.duplex
+  if (!(source instanceof Request) || init?.body === undefined || duplex !== undefined) {
+    return new Request(source, init)
+  }
+
+  const sourceDuplex = (source as RequestWithDuplex).duplex
+  if (!sourceDuplex) return new Request(source, init)
+  return new Request(source, { ...init, duplex: sourceDuplex } as RequestInit)
+}
+
+function forwardBody(input: RequestInfo | URL, init: RequestInit | undefined, request: Request): RequestBody {
+  if (init?.body !== undefined) return init.body
+  if (input instanceof Request) return request.body ?? undefined
+  return undefined
+}
+
+function normalizeFetchRequest(input: RequestInfo | URL, init?: RequestInit): NormalizedFetchRequest {
+  const request = requestWithFetchSemantics(input, init)
+  return {
+    input,
+    request,
+    url: new URL(request.url),
+    method: request.method.toUpperCase(),
+    headers: new Headers(request.headers),
+    forwardBody: forwardBody(input, init, request),
+  }
 }
 
 function cleanedHeaders(headers: Headers, config: OpenAICompactConfig): Headers {
@@ -245,31 +286,26 @@ function cleanedHeaders(headers: Headers, config: OpenAICompactConfig): Headers 
   return result
 }
 
-function fetchInit(init: RequestInit | undefined, headers: Headers): RequestInit {
-  return init ? { ...init, headers } : { headers }
-}
-
-type RequestInitWithDuplex = RequestInit & { duplex?: "half" }
-
-function fetchInitForReroute(input: RequestInfo | URL, init: RequestInit | undefined, headers: Headers): RequestInit {
-  if (!(input instanceof Request)) return fetchInit(init, headers)
-
+function fetchInitForReroute(
+  request: Request,
+  headers: Headers,
+  body: RequestBody = request.body ?? undefined,
+): RequestInit {
   const requestInit: RequestInitWithDuplex = {
-    method: input.method,
-    body: input.body,
-    cache: input.cache,
-    credentials: input.credentials,
-    integrity: input.integrity,
-    keepalive: input.keepalive,
-    mode: input.mode,
-    redirect: input.redirect,
-    referrer: input.referrer,
-    referrerPolicy: input.referrerPolicy,
-    signal: input.signal,
-    ...init,
+    method: request.method,
+    cache: request.cache,
+    credentials: request.credentials,
+    integrity: request.integrity,
+    keepalive: request.keepalive,
+    mode: request.mode,
+    redirect: request.redirect,
+    referrer: request.referrer,
+    referrerPolicy: request.referrerPolicy,
+    signal: request.signal,
     headers,
   }
-  const duplex = (input as Request & { duplex?: "half" }).duplex
+  if (body !== undefined) requestInit.body = body
+  const duplex = (request as RequestWithDuplex).duplex
   if (duplex && requestInit.body !== undefined && requestInit.body !== null) requestInit.duplex = duplex
   return requestInit
 }
@@ -284,13 +320,17 @@ function compactMarkers(headers: Headers, config: OpenAICompactConfig) {
   return { sessionID, shouldCompact, shouldNativeCompact }
 }
 
-async function bodyText(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
-  if (typeof init?.body === "string") return init.body
-  if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) return new TextDecoder().decode(init.body)
-  // An unsupported override must not silently fall back to the Request's different original body.
-  if (init?.body != null) return undefined
-  if (input instanceof Request) return input.clone().text()
-  return undefined
+async function readNormalizedBody(request: NormalizedFetchRequest) {
+  if (request.bodyText !== undefined) return request
+  if (request.request.body === null) return request
+  try {
+    request.bodyText = await request.request.clone().text()
+    request.body = parseJsonRecord(request.bodyText)
+  } catch {
+    request.bodyText = undefined
+    request.body = undefined
+  }
+  return request
 }
 
 function contentText(value: unknown): string {
@@ -709,6 +749,13 @@ function parseJsonRecord(text: string | undefined): AnyRecord | undefined {
   } catch {
     return undefined
   }
+}
+
+function prependCheckpointItems(checkpoint: Checkpoint, input: unknown[]) {
+  const prefix = checkpoint.items
+  const alreadyPresent = input.length >= prefix.length &&
+    JSON.stringify(input.slice(0, prefix.length)) === JSON.stringify(prefix)
+  return alreadyPresent ? structuredClone(input) : [...structuredClone(prefix), ...input]
 }
 
 function usageFrom(value: AnyRecord | undefined): AnyRecord {
@@ -1770,45 +1817,47 @@ export function createCompactHooks(
     }
   }
 
-  async function initWithCompactedInput(
+  function initWithCompactedInput(
     providerID: string,
-    requestInput: RequestInfo | URL,
-    init: RequestInit | undefined,
+    request: NormalizedFetchRequest,
     headers: Headers,
     sessionID: string,
-    selectedCheckpoint?: Checkpoint,
-  ): Promise<RequestInit> {
+    selectedCheckpoint: Checkpoint | undefined,
+    body: AnyRecord | undefined,
+  ): { init: RequestInit; body?: AnyRecord } {
     const checkpoint = selectedCheckpoint ?? activeCheckpointByProvider.get(providerID)?.get(sessionID)
-    const body = parseJsonRecord(await bodyText(requestInput, init))
-    if (!body || !Array.isArray(body.input)) {
-      return fetchInitForReroute(requestInput, init, headers)
-    }
+    const original = fetchInitForReroute(request.request, headers, request.forwardBody)
+    if (!body || !Array.isArray(body.input) || !checkpoint) return { init: original, body }
 
-    if (!checkpoint) return fetchInitForReroute(requestInput, init, headers)
-
-    headers.set("content-type", "application/json")
     const next = {
       ...body,
-      input: [...structuredClone(checkpoint.items), ...body.input],
+      input: prependCheckpointItems(checkpoint, body.input),
     }
-    return { ...fetchInitForReroute(requestInput, init, headers), body: JSON.stringify(next) }
+    const nextHeaders = new Headers(headers)
+    nextHeaders.set("content-type", "application/json")
+    nextHeaders.delete("content-length")
+    return {
+      init: { ...fetchInitForReroute(request.request, nextHeaders, JSON.stringify(next)), body: JSON.stringify(next) },
+      body: next,
+    }
   }
 
   function prepareCompactOperation(
     operation: CompactOperation,
     originalBody: string,
+    body: AnyRecord | undefined,
     url: URL,
     headers: Headers,
     provider: ProviderConfig,
   ): PreparedCompactRequest | undefined {
     const { providerID, sessionID, snapshot } = operation
-    let body = parseJsonRecord(originalBody)
+    let nextBody = body
     const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
-    if (body && Array.isArray(body.input) && checkpoint) {
-      body = { ...body, input: [...structuredClone(checkpoint.items), ...body.input] }
+    if (nextBody && Array.isArray(nextBody.input) && checkpoint) {
+      nextBody = { ...nextBody, input: prependCheckpointItems(checkpoint, nextBody.input) }
     }
     const target = usesOpenAIOAuth(providerID, headers) ? chatGPTCodexResponsesEndpoint : url.href
-    if (!body || typeof body.model !== "string" || !Array.isArray(body.input)) {
+    if (!nextBody || typeof nextBody.model !== "string" || !Array.isArray(nextBody.input)) {
       if (snapshot) {
         operation.failure = "OpenAI compact structured request could not be prepared safely"
         return undefined
@@ -1817,20 +1866,20 @@ export function createCompactHooks(
     }
 
     const conversation = snapshot?.conversation?.providerID === providerID ? snapshot.conversation : undefined
-    const model = provider.compactModel ?? conversation?.modelID ?? body.model
+    const model = provider.compactModel ?? conversation?.modelID ?? nextBody.model
     const reasoningEffort = provider.compactReasoningEffort ?? conversation?.reasoningEffort ??
-      compactReasoningEffort(asRecord(body.reasoning)?.effort) ?? null
+      compactReasoningEffort(asRecord(nextBody.reasoning)?.effort) ?? null
     const attachmentFallbacks = new Map<AnyRecord, AnyRecord>()
     const input = structuredInputFor(providerID, sessionID, model, snapshot, attachmentFallbacks)
     if (snapshot && !input) {
       operation.failure = "OpenAI compact structured history could not be converted safely"
       return undefined
     }
-    if (!input && !isKnownOpenCodeCompactionBody(body)) {
-      return { body: JSON.stringify(body), target, model, summary: config.summary, passthrough: true }
+    if (!input && !isKnownOpenCodeCompactionBody(nextBody)) {
+      return { body: JSON.stringify(nextBody), target, model, summary: config.summary, passthrough: true }
     }
 
-    const compact = compactBody(body, model, config, reasoningEffort)
+    const compact = compactBody(nextBody, model, config, reasoningEffort)
     delete compact.instructions
     if (input) compact.input = [...input, { type: "compaction_trigger" }]
     const request = withStableInstructions(
@@ -1838,11 +1887,15 @@ export function createCompactHooks(
       stableInstructionsByProvider.get(providerID)?.get(sessionID),
       config.compactBodyKeys.includes("instructions"),
     )
+    const checkpointInput = Array.isArray(request.input) ? structuredClone(request.input) : undefined
+    const fallbackInput = attachmentFallbacks.size
+      ? attachmentFallbackInput(request.input, attachmentFallbacks)
+      : undefined
     return {
       body: JSON.stringify(request),
-      fallbackBody: attachmentFallbacks.size
-        ? JSON.stringify({ ...request, input: attachmentFallbackInput(request.input, attachmentFallbacks) })
-        : undefined,
+      fallbackBody: fallbackInput ? JSON.stringify({ ...request, input: fallbackInput }) : undefined,
+      checkpointInput,
+      fallbackCheckpointInput: Array.isArray(fallbackInput) ? structuredClone(fallbackInput) : undefined,
       target, model, summary: config.summary, passthrough: false,
     }
   }
@@ -1895,34 +1948,34 @@ export function createCompactHooks(
 
   async function runCompactOperation(
     operation: CompactOperation,
-    requestInput: RequestInfo | URL,
-    init: RequestInit | undefined,
+    request: NormalizedFetchRequest,
     headers: Headers,
     baseFetch: FetchLike,
   ): Promise<Response> {
     if (operation.pendingCommit) return completeCompactOperation(operation, operation.pendingCommit)
     const prepared = operation.prepared!
-    const signal = init?.signal !== undefined ? init.signal : (requestInput instanceof Request ? requestInput.signal : undefined)
+    const signal = request.request.signal
     const combinedSignal = signal ? AbortSignal.any([signal, operation.controller.signal]) : operation.controller.signal
     const send = async () => {
       if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
       const oauth = usesOpenAIOAuth(operation.providerID, headers)
-      const target = oauth ? chatGPTCodexResponsesEndpoint : urlOf(requestInput)!.href
+      const target = oauth ? chatGPTCodexResponsesEndpoint : request.url.href
       if (target !== prepared.target) {
         return new Response("OpenAI compact operation cannot change its target endpoint", { status: 400 })
       }
       const outboundHeaders = new Headers(headers)
       outboundHeaders.set("content-type", "application/json")
-      let request: RequestInit = {
-        ...fetchInitForReroute(requestInput, init, outboundHeaders),
+      outboundHeaders.delete("content-length")
+      let requestInit: RequestInit = {
+        ...fetchInitForReroute(request.request, outboundHeaders, prepared.body),
         method: "POST",
         body: prepared.body,
         signal: combinedSignal,
       }
-      if (oauth) request = await openAIOAuth.requestInit(request)
+      if (oauth) requestInit = await openAIOAuth.requestInit(requestInit)
       if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
-      request.signal?.throwIfAborted()
-      return baseFetch(prepared.target, request)
+      requestInit.signal?.throwIfAborted()
+      return baseFetch(prepared.target, requestInit)
     }
     let response = await send()
     if (prepared.fallbackBody && await isAttachmentRejection(response)) {
@@ -1930,6 +1983,8 @@ export function createCompactHooks(
       // Promote before sending: a failed fallback attempt must never restore the original attachments.
       prepared.body = prepared.fallbackBody
       prepared.fallbackBody = undefined
+      prepared.checkpointInput = prepared.fallbackCheckpointInput
+      prepared.fallbackCheckpointInput = undefined
       response = await send()
     }
     if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
@@ -1941,7 +1996,9 @@ export function createCompactHooks(
       if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
       signal?.throwIfAborted()
       const compaction = asRecord(payload?.compaction)
-      const items = compaction ? compactedItemsForV2(JSON.parse(prepared.body).input, compaction) : undefined
+      const items = compaction && prepared.checkpointInput
+        ? compactedItemsForV2(prepared.checkpointInput, compaction)
+        : undefined
       if (!items) {
         return new Response("OpenAI compact response stream must complete with exactly one valid compaction item", {
           status: 502,
@@ -1973,8 +2030,7 @@ export function createCompactHooks(
     provider: ProviderConfig,
     sessionID: string,
     operationID: string | null,
-    requestInput: RequestInfo | URL,
-    init: RequestInit | undefined,
+    request: NormalizedFetchRequest,
     headers: Headers,
     baseFetch: FetchLike,
   ): Promise<Response> {
@@ -2011,17 +2067,15 @@ export function createCompactHooks(
       return new Response(checkpointConflictMessage, { status: 409 })
     }
 
-    const text = await bodyText(requestInput, init)
+    await readNormalizedBody(request)
     if (!currentSession(sessionID, generation) || compactOperationsByProvider.get(providerID)?.get(sessionID) !== operation ||
       (compactionCaptures.has(sessionID) && compactionCaptures.get(sessionID)?.id !== operation.id)) {
       return new Response("OpenAI compact operation is no longer valid; start a new compaction", { status: 400 })
     }
-    if (text === undefined) {
+    if (request.bodyText === undefined) {
       return new Response("OpenAI compact request body could not be read safely", { status: 400 })
     }
-    const url = urlOf(requestInput)!
-    const method = (init?.method ?? (requestInput instanceof Request ? requestInput.method : "GET")).toUpperCase()
-    const fingerprint = createHash("sha256").update(JSON.stringify([url.href, method, text])).digest("hex")
+    const fingerprint = createHash("sha256").update(JSON.stringify([request.url.href, request.method, request.bodyText])).digest("hex")
     if (operation.fingerprint && operation.fingerprint !== fingerprint) {
       if (operationID === null && operation.completed) {
         if (compactionOwners.has(sessionID)) return new Response(compactBusyMessage, { status: 409 })
@@ -2032,13 +2086,13 @@ export function createCompactHooks(
       return new Response(compactInvalidMessage, { status: 400 })
     }
     operation.fingerprint = fingerprint
-    const signal = init?.signal !== undefined ? init.signal : (requestInput instanceof Request ? requestInput.signal : undefined)
+    const signal = request.request.signal
     signal?.throwIfAborted()
     if (operation.failure) return new Response(operation.failure, { status: 502 })
     if (operation.result) return operation.result.clone()
     if (!operation.prepared) {
       try {
-        operation.prepared = prepareCompactOperation(operation, text, url, headers, provider)
+        operation.prepared = prepareCompactOperation(operation, request.bodyText, request.body, request.url, headers, provider)
       } catch {
         operation.failure = "OpenAI compact structured request could not be prepared safely"
       }
@@ -2048,7 +2102,7 @@ export function createCompactHooks(
     if (!operation.inFlight) {
       operation.generation.activity++
       const current = operation
-      current.inFlight = runCompactOperation(current, requestInput, init, headers, baseFetch)
+      current.inFlight = runCompactOperation(current, request, headers, baseFetch)
         .catch((error) => {
           if (!currentOperation(current)) return new Response(compactInvalidMessage, { status: 400 })
           throw error
@@ -2069,19 +2123,25 @@ export function createCompactHooks(
     const baseFetch = typeof previousBase === "function" ? (previousBase as FetchLike) : base
 
     const wrapped = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
-      const url = urlOf(requestInput)
-      const headers = requestHeaders(requestInput, init)
-      const operationID = headers.get(compactOperationHeader)
-      const { sessionID: headerSessionID, shouldCompact, shouldNativeCompact } = compactMarkers(headers, config)
-      const isResponsesRequest = url ? isResponsesUrl(url, config) : false
-      const outboundHeaders = cleanedHeaders(headers, config)
-
       if (disposed) return new Response("OpenAI compact plugin has been disposed", { status: 400 })
+      const request = normalizeFetchRequest(requestInput, init)
+      const operationID = request.headers.get(compactOperationHeader)
+      const markerHeaders = new Headers(request.headers)
+      const { sessionID: headerSessionID, shouldCompact, shouldNativeCompact } = compactMarkers(markerHeaders, config)
+      const isResponsesRequest = isResponsesUrl(request.url, config)
+      const outboundHeaders = cleanedHeaders(request.headers, config)
+
       if (operationID !== null && (!isResponsesRequest || (!shouldCompact && !shouldNativeCompact))) {
         return new Response("OpenAI compact operation requires its original compaction endpoint and markers", { status: 400 })
       }
       if (!isResponsesRequest) {
-        return baseFetch(requestInput, fetchInit(init, outboundHeaders))
+        return baseFetch(request.input, fetchInitForReroute(request.request, outboundHeaders, request.forwardBody))
+      }
+      if (request.method !== "POST") {
+        if (shouldCompact || shouldNativeCompact || operationID !== null) {
+          return new Response("OpenAI compact requests must use POST", { status: 400 })
+        }
+        return baseFetch(request.input, fetchInitForReroute(request.request, outboundHeaders, request.forwardBody))
       }
 
       const sessionID = headerSessionID
@@ -2091,8 +2151,10 @@ export function createCompactHooks(
         return new Response("OpenAI compact request is missing session header", { status: 400 })
       }
       if (shouldCompact && sessionID) {
-        return fetchCompactOperation(providerID, provider, sessionID, operationID, requestInput, init, outboundHeaders, baseFetch)
+        await readNormalizedBody(request)
+        return fetchCompactOperation(providerID, provider, sessionID, operationID, request, outboundHeaders, baseFetch)
       }
+      if (sessionID || shouldNativeCompact) await readNormalizedBody(request)
       if (sessionID) {
         try {
           const state = refreshSessionState(sessionID)
@@ -2108,23 +2170,25 @@ export function createCompactHooks(
         !currentNativeCompaction(sessionID!, matchingNativeCompaction))) {
         return new Response("OpenAI native compact operation is unavailable; start a new compaction", { status: 400 })
       }
-      let originalRequestInit = fetchInitForReroute(requestInput, init, outboundHeaders)
-      if (shouldNativeCompact) {
-        const originalBody = await bodyText(requestInput, init)
-        if (originalBody !== undefined) originalRequestInit = { ...originalRequestInit, body: originalBody }
-      }
+      const originalBody = request.bodyText !== undefined ? request.bodyText : request.forwardBody
+      let originalRequestInit = fetchInitForReroute(request.request, outboundHeaders, originalBody)
+      let requestBody = request.body
       const suppressInvalidCheckpoint = !!matchingNativeCompaction && !shouldNativeCompact
-      const requestInit =
-        sessionID && !suppressInvalidCheckpoint && (!shouldNativeCompact || matchingNativeCompaction)
-          ? await initWithCompactedInput(
-              providerID,
-              requestInput,
-              init,
-              outboundHeaders,
-              sessionID,
-              shouldNativeCompact ? matchingNativeCompaction?.checkpoint : undefined,
-            )
-          : originalRequestInit
+      let requestInit: RequestInit
+      if (sessionID && !suppressInvalidCheckpoint && (!shouldNativeCompact || matchingNativeCompaction)) {
+        const compacted = initWithCompactedInput(
+          providerID,
+          request,
+          outboundHeaders,
+          sessionID,
+          shouldNativeCompact ? matchingNativeCompaction?.checkpoint : undefined,
+          request.body,
+        )
+        requestInit = compacted.init
+        requestBody = compacted.body
+      } else {
+        requestInit = originalRequestInit
+      }
       if (shouldNativeCompact) {
         const controller = compactionCaptures.get(sessionID!)?.controller
         if (!controller || !currentNativeCompaction(sessionID!, matchingNativeCompaction)) {
@@ -2133,13 +2197,13 @@ export function createCompactHooks(
         requestInit.signal = requestInit.signal ? AbortSignal.any([requestInit.signal, controller.signal]) : controller.signal
         originalRequestInit.signal = requestInit.signal
       }
-      const route = async (request: RequestInit) => {
-        const authRequest = usesOpenAIOAuth(providerID, new Headers(request.headers))
-          ? await openAIOAuth.requestInit(request)
+      const route = async (nextRequest: RequestInit) => {
+        const authRequest = usesOpenAIOAuth(providerID, new Headers(nextRequest.headers))
+          ? await openAIOAuth.requestInit(nextRequest)
           : undefined
         return {
-          input: authRequest ? chatGPTCodexResponsesEndpoint : requestInput,
-          init: authRequest ?? request,
+          input: authRequest ? chatGPTCodexResponsesEndpoint : request.input,
+          init: authRequest ?? nextRequest,
         }
       }
       const routed = await route(requestInit)
@@ -2150,15 +2214,14 @@ export function createCompactHooks(
       }
 
       if (disposed || sessionGeneration(sessionID).deleted) return new Response(compactInvalidMessage, { status: 400 })
-      const body = parseJsonRecord(typeof routedRequestInit.body === "string" ? routedRequestInit.body : undefined)
       if (shouldNativeCompact) {
         const unavailable = () => new Response("OpenAI native compact operation is no longer valid", { status: 400 })
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
-        const send = async (input: RequestInfo | URL, request: RequestInit) => {
+        const send = async (input: RequestInfo | URL, nextRequest: RequestInit) => {
           sessionGeneration(sessionID).activity++
           try {
-            request.signal?.throwIfAborted()
-            return await baseFetch(input, request)
+            nextRequest.signal?.throwIfAborted()
+            return await baseFetch(input, nextRequest)
           } catch (error) {
             if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
             throw error
@@ -2187,7 +2250,7 @@ export function createCompactHooks(
         matchingNativeCompaction.completed = true
         return retriedResponse
       }
-      if (generation && currentSession(sessionID, generation)) rememberStableInstructions(providerID, sessionID, body)
+      if (generation && currentSession(sessionID, generation)) rememberStableInstructions(providerID, sessionID, requestBody)
       return baseFetch(routedRequestInput, routedRequestInit)
     }) as FetchLike
 

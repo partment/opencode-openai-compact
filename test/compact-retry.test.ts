@@ -497,7 +497,7 @@ describe("immutable compaction retries", () => {
     } finally { f.store.close() }
   })
 
-  test("does not fingerprint a Request's original body when an unsupported body override is supplied", async () => {
+  test("fingerprints a Blob body override instead of using the Request's original body", async () => {
     const network = vi.fn(async () => new Response("limited", { status: 429 }))
     const f = await retrySession(network as typeof fetch)
     try {
@@ -505,7 +505,7 @@ describe("immutable compaction retries", () => {
       expect((await f.fetch(request)).status).toBe(429)
       const overridden = await f.fetch(request, { body: new Blob(["different body"]) })
       expect(overridden.status).toBe(400)
-      expect(await overridden.text()).toContain("could not be read safely")
+      expect(await overridden.text()).toContain("cannot change its original request")
       expect(network).toHaveBeenCalledTimes(1)
       expect((await f.fetch(request)).status).toBe(429)
     } finally { f.store.close() }
