@@ -26,6 +26,7 @@ jobs:
       - name: Setup pnpm and Node.js
         uses: pnpm/setup@v2
         with:
+          version: 12.3.4
           runtime: node@${{ matrix.node-version }}
           install: false
 

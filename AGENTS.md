@@ -2,7 +2,7 @@
 
 ## Commands
 
-- Use `pnpm@11.21.0`.
+- Use `pnpm@12.3.4`.
 - Check order: `pnpm run typecheck`, `pnpm run test`, `pnpm run build`.
 - Tests use `vitest run`; SQLite binding order is `bun:sqlite` -> `node:sqlite` -> `better-sqlite3`.
 - No lint or formatter script exists. Do not invent one.
