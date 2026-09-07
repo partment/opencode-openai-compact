@@ -20,14 +20,23 @@
       "minProperties": 1,
       "default": {
         "openai": {
+          "enabled": true,
           "compactModel": null,
           "compactReasoningEffort": null
         }
+      },
+      "propertyNames": {
+        "minLength": 1
       },
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enables or disables compaction wrapping for this OpenCode provider."
+          },
           "compactModel": {
             "type": ["string", "null"],
             "minLength": 1,
@@ -47,19 +56,24 @@
     "headers": {
       "type": "object",
       "additionalProperties": false,
-      "default": {},
+      "default": {
+        "compact": "x-opencode-openai-responses-compact",
+        "session": "x-opencode-openai-responses-compact-session"
+      },
       "properties": {
         "compact": {
           "type": "string",
+          "pattern": "^(?!\\s*(?:authorization|proxy-authorization|content-type|content-length|host|connection|transfer-encoding|upgrade|cookie|set-cookie|chatgpt-account-id|x-opencode-openai-compact-operation)\\s*$)\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$",
           "minLength": 1,
           "default": "x-opencode-openai-responses-compact",
-          "description": "Internal request header used to mark compaction calls."
+          "description": "Internal request header used to mark compaction calls. Names are trimmed and normalized to lowercase at runtime."
         },
         "session": {
           "type": "string",
+          "pattern": "^(?!\\s*(?:authorization|proxy-authorization|content-type|content-length|host|connection|transfer-encoding|upgrade|cookie|set-cookie|chatgpt-account-id|x-opencode-openai-compact-operation)\\s*$)\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$",
           "minLength": 1,
           "default": "x-opencode-openai-responses-compact-session",
-          "description": "Internal request header used to pass the OpenCode session id into fetch."
+          "description": "Internal request header used to pass the OpenCode session id into fetch. It must differ from compact and cannot use reserved protocol or authentication names."
         }
       }
     },
@@ -70,12 +84,14 @@
       "properties": {
         "endpointPath": {
           "type": "string",
+          "pattern": "^(?=.*\\S)(?!\\s*/+\\s*$).+$",
           "minLength": 1,
           "default": "/responses",
-          "description": "Responses API endpoint path suffix to intercept."
+          "description": "Responses API endpoint path suffix to intercept. Whitespace-only and root paths are rejected."
         },
         "compactEndpointPath": {
           "type": "string",
+          "pattern": "^(?=.*\\S)(?!\\s*/+\\s*$).+$",
           "minLength": 1,
           "default": "/responses/compact",
           "deprecated": true,

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test, vi } from "vitest"
 import { createCompactHooks } from "../src/compact.js"
 import { loadConfig } from "../src/config.js"
 import { server } from "../src/index.js"
-import { defaultConfig } from "../src/schema.js"
+import { defaultConfig, OpenAICompactConfigSchema } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
 
 vi.mock("../src/compact.js", () => ({ createCompactHooks: vi.fn(() => ({})) }))
@@ -15,6 +15,16 @@ beforeEach(() => {
 })
 
 describe("plugin store lifecycle", () => {
+  test("does not open the shared store when every provider is disabled", async () => {
+    vi.mocked(loadConfig).mockResolvedValue(
+      OpenAICompactConfigSchema.parse({ providers: { openai: { enabled: false } } }),
+    )
+    const open = vi.spyOn(CheckpointStore, "open")
+    await expect(server({ client: {}, directory: ".", worktree: "." } as any)).resolves.toEqual({})
+    expect(open).not.toHaveBeenCalled()
+    open.mockRestore()
+  })
+
   test("prunes once before handing the store to hooks", async () => {
     const store = CheckpointStore.openMemory()
     const open = vi.spyOn(CheckpointStore, "open").mockResolvedValue(store)

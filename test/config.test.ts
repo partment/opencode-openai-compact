@@ -1,8 +1,10 @@
+import Ajv from "ajv/dist/2020.js"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { loadConfig } from "../src/config.js"
+import { OpenAICompactConfigSchema } from "../src/schema.js"
 
 const originalEnv = { ...process.env }
 const tempRoots: string[] = []
@@ -119,6 +121,60 @@ describe("loadConfig", () => {
     expect(config.state.retentionDays).toBe(30)
     expect(warn).toHaveBeenCalledOnce()
     warn.mockRestore()
+  })
+
+  test("rejects unknown nested fields and keeps schema validation aligned", async () => {
+    expect(() => OpenAICompactConfigSchema.parse({ state: { retentionDay: 1 } })).toThrow()
+    expect(() => OpenAICompactConfigSchema.parse({ headers: { extra: "x-test" } })).toThrow()
+    expect(() => OpenAICompactConfigSchema.parse({ responses: { extra: "/other" } })).toThrow()
+
+    const schema = JSON.parse(await readFile(path.resolve("configSchema.json"), "utf8"))
+    const validate = new Ajv({ allErrors: true }).compile(schema)
+    const valid = {
+      providers: { openai: { enabled: false }, custom: {} },
+      headers: { compact: "x-compact", session: "x-session" },
+      responses: { endpointPath: "/responses" },
+      state: { retentionDays: 30 },
+    }
+    expect(validate(valid)).toBe(true)
+    expect(() => OpenAICompactConfigSchema.parse(valid)).not.toThrow()
+
+    const invalid = { state: { retentionDay: 1 } }
+    expect(validate(invalid)).toBe(false)
+    expect(() => OpenAICompactConfigSchema.parse(invalid)).toThrow()
+
+    const invalidHeader = { headers: { compact: " authorization ", session: "x-session" } }
+    expect(validate(invalidHeader)).toBe(false)
+    expect(() => OpenAICompactConfigSchema.parse(invalidHeader)).toThrow()
+  })
+
+  test("reports JSONC errors with line and column", async () => {
+    const root = await tempDir()
+    const xdg = path.join(root, "xdg")
+    const global = path.join(xdg, "opencode")
+    await mkdir(global, { recursive: true })
+    await writeFile(path.join(global, "openai-compact.jsonc"), '{\n  "state": {\n    "retentionDays": 1,\n  }')
+    process.env.XDG_CONFIG_HOME = xdg
+    await expect(loadConfig({ directory: root, worktree: root })).rejects.toThrow(/line \d+, column \d+/)
+  })
+
+  test("emits an opt-in effective configuration diagnostic", async () => {
+    const root = await tempDir()
+    const xdg = path.join(root, "xdg")
+    const global = path.join(xdg, "opencode")
+    await mkdir(global, { recursive: true })
+    await writeFile(path.join(global, "openai-compact.json"), '{ "providers": { "openai": { "enabled": false } } }')
+    process.env.XDG_CONFIG_HOME = xdg
+    process.env.OPENCODE_OPENAI_COMPACT_DEBUG = "1"
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {})
+
+    await loadConfig({ directory: root, worktree: root })
+
+    expect(debug).toHaveBeenCalledOnce()
+    const message = String(debug.mock.calls[0][1])
+    expect(message).toContain('"databasePath"')
+    expect(message).toContain('"enabled": false')
+    expect(message).toContain("openai-compact.json")
   })
 
   test("creates a global openai-compact.jsonc when no global config exists", async () => {

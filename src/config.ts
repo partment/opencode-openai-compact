@@ -5,6 +5,7 @@ import { mergeDeep } from "./merge.js"
 import { defaultConfig, OpenAICompactConfigSchema, type OpenAICompactConfig } from "./schema.js"
 import {
   getConfigSources,
+  getDatabasePath,
   getDefaultConfigPath,
   getGlobalConfigSources,
   type ConfigContext,
@@ -26,7 +27,13 @@ async function readOptionalJsonc(source: ConfigSource) {
   const parsed = parse(text, errors, { allowTrailingComma: true })
   if (errors.length > 0) {
     const first = errors[0]
-    throw new Error(`Invalid JSONC in ${source.path}: ${printParseErrorCode(first.error)} at offset ${first.offset}`)
+    const lines = text.slice(0, first.offset).split(/\r\n|\r|\n/)
+    const line = lines.length
+    const column = lines[lines.length - 1].length + 1
+    throw new Error(
+      `Invalid JSONC in ${source.path}: ${printParseErrorCode(first.error)} at ` +
+      `line ${line}, column ${column} (offset ${first.offset})`,
+    )
   }
   return parsed ?? {}
 }
@@ -40,16 +47,22 @@ function configPathIdentity(file: string) {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved
 }
 
-function withoutNonGlobalRetention(data: unknown, source: ConfigSource, globalPaths: Set<string>) {
+function withoutNonGlobalRetention(
+  data: unknown,
+  source: ConfigSource,
+  globalPaths: Set<string>,
+  ignored: string[],
+) {
   if (globalPaths.has(configPathIdentity(source.path))) return data
   const root = asRecord(data)
   const state = asRecord(root?.state)
   if (!root || !state || !Object.hasOwn(state, "retentionDays")) return data
 
-  console.warn(
+  const warning =
     `opencode-openai-compact: ignoring state.retentionDays in ${source.path}; ` +
-      `retention is a global database policy. Move it to ${getDefaultConfigPath()}.`,
-  )
+    `retention is a global database policy. Move it to ${getDefaultConfigPath()}.`
+  ignored.push(warning)
+  console.warn(warning)
   const { retentionDays: _ignored, ...remainingState } = state
   return { ...root, state: remainingState }
 }
@@ -89,14 +102,44 @@ export async function loadConfig(context: ConfigContext): Promise<OpenAICompactC
   await ensureGlobalConfigFile()
 
   let merged: unknown = defaultConfig
+  const sources = getConfigSources(context)
   const globalPaths = new Set(getGlobalConfigSources().map((source) => configPathIdentity(source.path)))
-  for (const source of getConfigSources(context)) {
+  const sourceStatus: Array<{ path: string; exists: boolean }> = []
+  const overrides: Array<{ source: string; path: string }> = []
+  const ignored: string[] = []
+  const deprecated: Array<{ source: string; path: string }> = []
+  for (const source of sources) {
     const data = await readOptionalJsonc(source)
+    sourceStatus.push({ path: source.path, exists: data !== undefined })
     if (data === undefined) continue
-    merged = mergeDeep(merged, withoutNonGlobalRetention(data, source, globalPaths))
+    const root = asRecord(data)
+    const responses = asRecord(root?.responses)
+    if (Object.hasOwn(responses ?? {}, "compactEndpointPath")) {
+      deprecated.push({ source: source.path, path: "responses.compactEndpointPath" })
+    }
+    const next = withoutNonGlobalRetention(data, source, globalPaths, ignored)
+    merged = mergeDeep(merged, next, (path) => overrides.push({ source: source.path, path }))
   }
 
-  return OpenAICompactConfigSchema.parse(merged)
+  const config = OpenAICompactConfigSchema.parse(merged)
+  if (process.env.OPENCODE_OPENAI_COMPACT_DEBUG === "1") {
+    console.debug("opencode-openai-compact: effective configuration", JSON.stringify({
+      sources: sourceStatus,
+      overrides,
+      enabled: config.enabled,
+      activeProviders: config.enabled
+        ? Object.keys(config.providers).filter((id) => config.providers[id].enabled)
+        : [],
+      providers: config.providers,
+      headers: config.headers,
+      responses: config.responses,
+      databasePath: getDatabasePath(),
+      retention: { days: config.state.retentionDays, scope: "global" },
+      ignored,
+      deprecated,
+    }, null, 2))
+  }
+  return config
 }
 
 export { getConfigSources }

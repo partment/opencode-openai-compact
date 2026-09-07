@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { compactBody, compactedItemsFrom, createCompactHooks } from "../src/compact.js"
+import { compactBody, compactedItemsFrom, createCompactHooks, isResponsesUrl } from "../src/compact.js"
 import { defaultConfig, OpenAICompactConfigSchema } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
 import { compactionFixture } from "./compaction-fixture.js"
@@ -237,6 +237,7 @@ function forkHistory(sessionID: string, prefix: string, now: number) {
 describe("OpenAI compact hooks", () => {
   test("defaults to following the conversation model and reasoning effort", () => {
     expect(defaultConfig.providers.openai).toEqual({
+      enabled: true,
       compactModel: null,
       compactReasoningEffort: null,
     })
@@ -244,11 +245,43 @@ describe("OpenAI compact hooks", () => {
       expect(
         OpenAICompactConfigSchema.parse({ providers: { openai: { compactReasoningEffort: effort } } }).providers
           .openai,
-      ).toEqual({ compactModel: null, compactReasoningEffort: effort })
+      ).toEqual({ enabled: true, compactModel: null, compactReasoningEffort: effort })
     }
     expect(() =>
       OpenAICompactConfigSchema.parse({ providers: { openai: { compactReasoningEffort: "unsupported" } } }),
     ).toThrow()
+  })
+
+  test("normalizes endpoint paths and keeps suffix matching bounded", () => {
+    const config = OpenAICompactConfigSchema.parse({ responses: { endpointPath: " responses/// " } })
+    expect(config.responses.endpointPath).toBe("/responses")
+    expect(isResponsesUrl(new URL("https://api.test/v1/responses"), config)).toBe(true)
+    expect(isResponsesUrl(new URL("https://api.test/v1/responses/extra"), config)).toBe(false)
+    expect(() => OpenAICompactConfigSchema.parse({ responses: { endpointPath: "  " } })).toThrow()
+    expect(() => OpenAICompactConfigSchema.parse({ responses: { endpointPath: "/" } })).toThrow()
+  })
+
+  test("validates and normalizes internal header names", () => {
+    const config = OpenAICompactConfigSchema.parse({ headers: { compact: " X-Compact ", session: "X-Session" } })
+    expect(config.headers).toEqual({ compact: "x-compact", session: "x-session" })
+    expect(() => OpenAICompactConfigSchema.parse({ headers: { compact: "authorization" } })).toThrow()
+    expect(() => OpenAICompactConfigSchema.parse({ headers: { compact: "X-Same", session: "x-same" } })).toThrow()
+    expect(() => OpenAICompactConfigSchema.parse({ headers: { compact: "not valid" } })).toThrow()
+  })
+
+  test("wraps only enabled providers", async () => {
+    const store = CheckpointStore.openMemory()
+    try {
+      const config = OpenAICompactConfigSchema.parse({ providers: { openai: { enabled: false }, other: {} } })
+      const hooks = createCompactHooks(config, store)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      expect(cfg.provider.openai).toBeUndefined()
+      expect(cfg.provider.other.options.fetch).toBeTypeOf("function")
+      await hooks.dispose?.()
+    } finally {
+      try { store.close() } catch { /* disposed hooks already close the store */ }
+    }
   })
 
   test("wraps the configured provider fetch", async () => {

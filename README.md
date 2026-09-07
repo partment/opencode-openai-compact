@@ -115,6 +115,7 @@ The default retention is 30 days. Retention is a global maintenance policy for t
   "enabled": true,
   "providers": {
     "openai": {
+      "enabled": true,
       "compactModel": null,
       "compactReasoningEffort": null
     }
@@ -149,7 +150,7 @@ The default retention is 30 days. Retention is a global maintenance policy for t
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | `boolean` | `true` | Enables or disables the plugin. |
-| `providers` | `object` | `{ "openai": { "compactModel": null, "compactReasoningEffort": null } }` | Provider ids to wrap, keyed by OpenCode provider id. |
+| `providers` | `object` | `{ "openai": { "enabled": true, "compactModel": null, "compactReasoningEffort": null } }` | Provider ids to wrap, keyed by OpenCode provider id. Each provider can be explicitly enabled or disabled. |
 | `headers` | `object` | see below | Internal header names. |
 | `responses` | `object` | see below | Responses endpoint path settings. |
 | `compactBodyKeys` | `string[]` | see example | Request body keys copied into compact calls. |
@@ -160,13 +161,14 @@ The default retention is 30 days. Retention is a global maintenance policy for t
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `compact` | `string` | `"x-opencode-openai-responses-compact"` | Internal header that marks a compaction request. |
-| `session` | `string` | `"x-opencode-openai-responses-compact-session"` | Internal header that carries the OpenCode session id. |
+| `compact` | `string` | `"x-opencode-openai-responses-compact"` | Internal header that marks a compaction request. Header names are normalized to lowercase and must be valid token names. |
+| `session` | `string` | `"x-opencode-openai-responses-compact-session"` | Internal header that carries the OpenCode session id. It must differ from `compact` and cannot use reserved authentication, content, connection, or routing names. |
 
 ### `providers`
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `providers.<id>.enabled` | `boolean` | `true` | Enables or disables compaction wrapping for this provider. Set `providers.openai.enabled` to `false` to leave the built-in OpenAI provider untouched. |
 | `providers.<id>.compactModel` | `string \| null` | `null` | Model sent to the `/responses` compaction v2 request. `null` follows the model used by the latest conversation part for both automatic and manual compaction. |
 | `providers.<id>.compactReasoningEffort` | `"none" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max" \| null` | `null` | Reasoning effort sent to compaction. `null` follows the current conversation selection. Supported levels vary by model. |
 
@@ -174,11 +176,22 @@ The default retention is 30 days. Retention is a global maintenance policy for t
 
 `null` uses the next available value in that order.
 
+Provider settings are deep-merged across configuration layers. Adding a custom provider does not remove the default `openai` entry. To use only a custom provider:
+
+```jsonc
+{
+  "providers": {
+    "openai": { "enabled": false },
+    "custom-openai": { "enabled": true }
+  }
+}
+```
+
 ### `responses`
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `endpointPath` | `string` | `"/responses"` | Responses API path suffix to intercept. |
+| `endpointPath` | `string` | `"/responses"` | Responses API path suffix to intercept. Whitespace-only values and `/` are rejected; values are trimmed, prefixed with `/`, and stripped of trailing slashes. |
 | `compactEndpointPath` | `string` | `"/responses/compact"` | Deprecated and ignored. Retained only so existing configuration files continue to load. |
 
 ### `state`
@@ -187,6 +200,12 @@ The default retention is 30 days. Retention is a global maintenance policy for t
 | --- | --- | --- | --- |
 | `retentionDays` | `integer` | `30` | Global number of days to keep checkpoints in the shared database. Only the fixed global config directory may override it; non-global values are ignored with a warning. |
 | `deleteOnSessionDeleted` | `boolean` | `true` | Deletes stored rows on `session.deleted`. When `false`, rows remain but are tombstoned and never used again. |
+
+### Configuration diagnostics
+
+Set `OPENCODE_OPENAI_COMPACT_DEBUG=1` to print an effective-configuration summary at startup. The summary includes existing configuration files, fields overridden by each layer, enabled providers, endpoint and header settings, the shared database path, the global retention scope, ignored retention overrides, and deprecated fields. It does not print authentication tokens.
+
+Unknown fields in nested objects are rejected instead of silently ignored. JSONC syntax errors include the source file, line, column, and parser error.
 
 ## Star Us On GitHub
 

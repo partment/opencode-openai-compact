@@ -1122,7 +1122,11 @@ export function createCompactHooks(
   options: CompactHookOptions = {},
 ): Hooks {
   retainOpenAIOAuthRuntime()
-  const configuredProviders = new Set(Object.keys(config.providers))
+  const configuredProviders = new Set(
+    Object.entries(config.providers)
+      .filter(([, provider]) => provider.enabled)
+      .map(([providerID]) => providerID),
+  )
   const checkpointsByProvider = new Map<string, Map<string, Checkpoint[]>>()
   const controlMessagesByProvider = new Map<string, Map<string, Map<string, ControlIdentity>>>()
   const sessionStates = new Map<string, SessionState>()
@@ -2271,7 +2275,7 @@ export function createCompactHooks(
 
   function getOpenAIWrappedFetch(base: FetchLike = baseFetch) {
     const provider = config.providers.openai
-    if (!provider) return undefined
+    if (!provider?.enabled) return undefined
     openAIWrappedFetch ??= wrapFetch(base, "openai", provider)
     return openAIWrappedFetch
   }
@@ -2360,7 +2364,7 @@ export function createCompactHooks(
   }
 
   const hooks: Hooks = {
-    auth: {
+    auth: configuredProviders.has("openai") ? {
       provider: "openai",
       methods: openAIAuthMethods,
       async loader(getAuth) {
@@ -2374,7 +2378,7 @@ export function createCompactHooks(
         }
         return {}
       },
-    },
+    } : undefined,
 
     async dispose() {
       disposed = true
@@ -2399,6 +2403,7 @@ export function createCompactHooks(
       root.provider ??= {}
       const providers = root.provider as AnyRecord
       for (const [providerID, compactProvider] of Object.entries(config.providers)) {
+        if (!compactProvider.enabled) continue
         providers[providerID] ??= {}
         const provider = providers[providerID] as AnyRecord
         provider.options ??= {}

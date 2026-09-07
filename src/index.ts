@@ -6,7 +6,7 @@ import { CheckpointStore } from "./state.js"
 
 export const server: Plugin = async ({ client, directory, worktree }) => {
   const config = await loadConfig({ directory, worktree })
-  if (!config.enabled) return {}
+  if (!config.enabled || !Object.values(config.providers).some((provider) => provider.enabled)) return {}
 
   const store = await CheckpointStore.open(getDatabasePath())
   try {

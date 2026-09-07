@@ -36,6 +36,7 @@ const defaultState = {
 
 const defaultProviders = {
   openai: {
+    enabled: true,
     compactModel: null,
     compactReasoningEffort: null,
   },
@@ -53,10 +54,44 @@ const defaultConfigValues = {
 
 function endpoint(value: string) {
   const trimmed = value.trim()
-  if (!trimmed) return trimmed
   const prefixed = trimmed.startsWith("/") ? trimmed : `/${trimmed}`
   return prefixed.length > 1 ? prefixed.replace(/\/+$/, "") : prefixed
 }
+
+const endpointPath = z.string()
+  .transform(endpoint)
+  .refine((value) => value.length > 1 && value !== "/", "Endpoint path must name a non-root path")
+
+const reservedHeaderNames = new Set([
+  "authorization",
+  "proxy-authorization",
+  "content-type",
+  "content-length",
+  "host",
+  "connection",
+  "transfer-encoding",
+  "upgrade",
+  "cookie",
+  "set-cookie",
+  "chatgpt-account-id",
+  "x-opencode-openai-compact-operation",
+])
+const headerName = z.string()
+  .transform((value) => value.trim().toLowerCase())
+  .refine((value) => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(value), "Invalid HTTP header name")
+  .refine((value) => !reservedHeaderNames.has(value), "Header name is reserved for protocol or authentication use")
+
+const headersSchema = z
+  .object({
+    compact: headerName.default(defaultHeaders.compact),
+    session: headerName.default(defaultHeaders.session),
+  })
+  .strict()
+  .superRefine((headers, context) => {
+    if (headers.compact === headers.session) {
+      context.addIssue({ code: "custom", path: ["session"], message: "Header names must be different" })
+    }
+  })
 
 export const OpenAICompactConfigSchema = z
   .object({
@@ -67,6 +102,7 @@ export const OpenAICompactConfigSchema = z
         z.string().min(1),
         z
           .object({
+            enabled: z.boolean().default(true),
             compactModel: z.string().min(1).nullable().default(null),
             compactReasoningEffort: z.enum(compactReasoningEfforts).nullable().default(null),
           })
@@ -74,18 +110,14 @@ export const OpenAICompactConfigSchema = z
       )
       .refine((providers) => Object.keys(providers).length > 0, "At least one provider is required")
       .default(defaultProviders),
-    headers: z
-      .object({
-        compact: z.string().min(1).default(defaultHeaders.compact),
-        session: z.string().min(1).default(defaultHeaders.session),
-      })
-      .default(defaultHeaders),
+    headers: headersSchema.default(defaultHeaders),
     responses: z
       .object({
-        endpointPath: z.string().min(1).transform(endpoint).default(defaultResponses.endpointPath),
+        endpointPath: endpointPath.default(defaultResponses.endpointPath),
         // Kept so existing config files continue to load; compaction v2 uses endpointPath.
-        compactEndpointPath: z.string().min(1).transform(endpoint).default(defaultResponses.compactEndpointPath),
+        compactEndpointPath: endpointPath.default(defaultResponses.compactEndpointPath),
       })
+      .strict()
       .default(defaultResponses),
     compactBodyKeys: z.array(z.string().min(1)).default([...defaultCompactBodyKeys]),
     summary: z.string().min(1).default(defaultCompactSummary),
@@ -98,6 +130,7 @@ export const OpenAICompactConfigSchema = z
           .describe("Retain deleted-session rows when false, but never keep using them")
           .default(defaultState.deleteOnSessionDeleted),
       })
+      .strict()
       .default(defaultState),
   })
   .strict()
