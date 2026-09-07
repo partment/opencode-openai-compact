@@ -1,6 +1,6 @@
 {
   "name": "opencode-openai-compact",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "description": "OpenCode plugin that stores OpenAI Responses API compaction checkpoints in SQLite.",
   "type": "module",
   "packageManager": "pnpm@12.3.4",
