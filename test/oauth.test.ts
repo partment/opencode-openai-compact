@@ -1,6 +1,11 @@
 import { describe, expect, test } from "vitest"
 import { createCompactHooks } from "../src/compact.js"
-import { openAIOAuthDummyKey } from "../src/oauth.js"
+import {
+  createOpenAIOAuth,
+  disposeOpenAIOAuth,
+  openAIOAuthDummyKey,
+  openAIAuthMethods,
+} from "../src/oauth.js"
 import { defaultConfig } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
 
@@ -48,7 +53,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
         }),
         {} as any,
       )
@@ -86,7 +91,7 @@ describe("OpenAI OAuth hooks", () => {
             type: "oauth",
             refresh: "refresh-token",
             access: "real-access-token",
-            expires: Date.now() + 60_000,
+            expires: Date.now() + 120_000,
             accountId: "acct_test",
           }
         },
@@ -270,7 +275,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
           accountId: "acct_test",
         }),
         {} as any,
@@ -350,7 +355,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
           accountId: "acct_test",
         }),
         {} as any,
@@ -402,7 +407,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
           accountId: "acct_test",
         }),
         {} as any,
@@ -457,7 +462,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
           accountId: "acct_test",
         }),
         {} as any,
@@ -500,7 +505,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
           accountId: "acct_test",
         }),
         {} as any,
@@ -555,7 +560,7 @@ describe("OpenAI OAuth hooks", () => {
           type: "oauth",
           refresh: "refresh-token",
           access: "real-access-token",
-          expires: Date.now() + 60_000,
+          expires: Date.now() + 120_000,
           accountId: "acct_test",
         }),
         {} as any,
@@ -663,6 +668,123 @@ describe("OpenAI OAuth hooks", () => {
     } finally {
       store.close()
     }
+  })
+
+  test("binds the browser callback to localhost and keeps invalid callbacks isolated", async () => {
+    const method = openAIAuthMethods[0] as any
+    let flow: any
+    try {
+      flow = await method.authorize()
+      const callbackResult = flow.callback()
+      void callbackResult.catch(() => {})
+      const authorize = new URL(flow.url)
+      const wrong = await fetch("http://localhost:1455/auth/callback?state=wrong&error=ignored")
+      expect(wrong.status).toBe(400)
+      expect(wrong.headers.get("content-type")).toContain("text/plain")
+      expect(wrong.headers.get("cache-control")).toBe("no-store")
+
+      const error = encodeURIComponent("<script>alert(1)</script>")
+      const callback = await fetch(`http://localhost:1455/auth/callback?state=${encodeURIComponent(authorize.searchParams.get("state")!)}&error_description=${error}`)
+      expect(callback.status).toBe(400)
+      expect(callback.headers.get("content-security-policy")).toContain("default-src 'none'")
+      expect(await callback.text()).toBe("<script>alert(1)</script>")
+      await expect(callbackResult).rejects.toThrow("<script>alert(1)</script>")
+    } finally {
+      disposeOpenAIOAuth()
+    }
+  })
+
+  test("requires the matching state to cancel a browser flow", async () => {
+    const method = openAIAuthMethods[0] as any
+    let flow: any
+    try {
+      flow = await method.authorize()
+      const callbackResult = flow.callback()
+      void callbackResult.catch(() => {})
+      const state = new URL(flow.url).searchParams.get("state")!
+      const wrong = await fetch("http://localhost:1455/cancel?state=wrong")
+      expect(wrong.status).toBe(400)
+      const cancelled = await fetch(`http://localhost:1455/cancel?state=${encodeURIComponent(state)}`)
+      expect(cancelled.status).toBe(200)
+      expect(await cancelled.text()).toBe("Login cancelled")
+      await expect(callbackResult).rejects.toThrow("Login cancelled")
+    } finally {
+      disposeOpenAIOAuth()
+    }
+  })
+
+  test("refreshes inside the safety margin and validates token lifetime", async () => {
+    const calls: RequestInit[] = []
+    let saved: any
+    const source = { type: "oauth" as const, refresh: "refresh-safety", access: "old", expires: Date.now() + 30_000 }
+    const oauth = createOpenAIOAuth({
+      getAuth: async () => source,
+      tokenFetch: (async (_input, init) => {
+        calls.push(init!)
+        return Response.json({ access_token: "new", refresh_token: "rotated", expires_in: 3600 })
+      }) as typeof fetch,
+      async setAuth(auth) { saved = auth },
+    })
+    const request = await oauth.requestInit({ headers: {} })
+    expect(new Headers(request.headers).get("authorization")).toBe("Bearer new")
+    expect(calls).toHaveLength(1)
+    expect(saved.refresh).toBe("rotated")
+
+    const invalid = createOpenAIOAuth({
+      getAuth: async () => ({ type: "oauth", refresh: "refresh-invalid", access: "old", expires: 0 }),
+      tokenFetch: (async () => Response.json({ access_token: "new", expires_in: Infinity })) as typeof fetch,
+      async setAuth() { throw new Error("must not persist") },
+    })
+    await expect(invalid.requestInit({ headers: {} })).rejects.toThrow("invalid expires_in")
+  })
+
+  test("retries only an explicit invalid_token response once", async () => {
+    let current = { type: "oauth" as const, refresh: "refresh-retry", access: "old", expires: Date.now() + 120_000 }
+    let refreshes = 0
+    const oauth = createOpenAIOAuth({
+      getAuth: async () => current,
+      tokenFetch: (async () => {
+        refreshes++
+        return Response.json({ access_token: "new", refresh_token: "refresh-new", expires_in: 3600 })
+      }) as typeof fetch,
+      async setAuth(auth) { current = auth },
+    })
+    const calls: string[] = []
+    const response = await oauth.request({ method: "POST", body: "stable" }, async (init) => {
+      calls.push(new Headers(init.headers).get("authorization") ?? "")
+      return calls.length === 1
+        ? Response.json({ error: "invalid_token" }, { status: 401 })
+        : new Response("ok")
+    })
+    expect(response.status).toBe(200)
+    expect(calls).toEqual(["Bearer old", "Bearer new"])
+    expect(refreshes).toBe(1)
+
+    const ordinary = createOpenAIOAuth({
+      getAuth: async () => ({ type: "oauth", refresh: "refresh-ordinary", access: "old", expires: Date.now() + 120_000 }),
+      tokenFetch: (async () => { throw new Error("must not refresh") }) as typeof fetch,
+    })
+    const unchanged = await ordinary.request({ headers: {} }, async () => new Response("unauthorized", { status: 401 }))
+    expect(unchanged.status).toBe(401)
+  })
+
+  test("shares one refresh flight between OAuth instances", async () => {
+    let current = { type: "oauth" as const, refresh: "refresh-shared", access: "old", expires: 0 }
+    let refreshes = 0
+    const tokenFetch = (async () => {
+      refreshes++
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      return Response.json({ access_token: "shared-new", refresh_token: "shared-rotated", expires_in: 3600 })
+    }) as typeof fetch
+    const make = () => createOpenAIOAuth({
+      getAuth: async () => current,
+      tokenFetch,
+      async setAuth(auth) { current = auth },
+    })
+    const [first, second] = await Promise.all([make().requestInit({ headers: {} }), make().requestInit({ headers: {} })])
+    expect(refreshes).toBe(1)
+    expect(new Headers(first.headers).get("authorization")).toBe("Bearer shared-new")
+    expect(new Headers(second.headers).get("authorization")).toBe("Bearer shared-new")
   })
 
   test("shares one token refresh across concurrent OpenAI OAuth responses", async () => {

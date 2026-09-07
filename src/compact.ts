@@ -10,6 +10,8 @@ import {
   asOpenAIOAuth,
   createOpenAIOAuth,
   openAIAuthMethods,
+  releaseOpenAIOAuthRuntime,
+  retainOpenAIOAuthRuntime,
   openAIOAuthDummyKey,
   usesOpenAIOAuth,
   type OpenAIOAuthAuth,
@@ -1119,6 +1121,7 @@ export function createCompactHooks(
   baseFetch: FetchLike = fetch,
   options: CompactHookOptions = {},
 ): Hooks {
+  retainOpenAIOAuthRuntime()
   const configuredProviders = new Set(Object.keys(config.providers))
   const checkpointsByProvider = new Map<string, Map<string, Checkpoint[]>>()
   const controlMessagesByProvider = new Map<string, Map<string, Map<string, ControlIdentity>>>()
@@ -1133,6 +1136,7 @@ export function createCompactHooks(
   const compactOperationsByProvider = new Map<string, Map<string, CompactOperation>>()
   const pendingNativeCompactions = new Map<string, PendingNativeCompaction>()
   let disposed = false
+  let oauthRuntimeRetained = true
   let openAIAuth: OpenAIOAuthAuth | undefined
   let openAIWrappedFetch: FetchLike | undefined
   const openAIOAuth = createOpenAIOAuth({
@@ -1972,10 +1976,12 @@ export function createCompactHooks(
         body: prepared.body,
         signal: combinedSignal,
       }
-      if (oauth) requestInit = await openAIOAuth.requestInit(requestInit)
-      if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
-      requestInit.signal?.throwIfAborted()
-      return baseFetch(prepared.target, requestInit)
+      const dispatch = async (nextRequest: RequestInit) => {
+        if (!currentOperation(operation)) return new Response(compactInvalidMessage, { status: 400 })
+        nextRequest.signal?.throwIfAborted()
+        return baseFetch(prepared.target, nextRequest)
+      }
+      return oauth ? openAIOAuth.request(requestInit, dispatch) : dispatch(requestInit)
     }
     let response = await send()
     if (prepared.fallbackBody && await isAttachmentRejection(response)) {
@@ -2197,39 +2203,43 @@ export function createCompactHooks(
         requestInit.signal = requestInit.signal ? AbortSignal.any([requestInit.signal, controller.signal]) : controller.signal
         originalRequestInit.signal = requestInit.signal
       }
-      const route = async (nextRequest: RequestInit) => {
-        const authRequest = usesOpenAIOAuth(providerID, new Headers(nextRequest.headers))
-          ? await openAIOAuth.requestInit(nextRequest)
-          : undefined
+      const route = (nextRequest: RequestInit) => {
+        const oauth = usesOpenAIOAuth(providerID, new Headers(nextRequest.headers))
         return {
-          input: authRequest ? chatGPTCodexResponsesEndpoint : request.input,
-          init: authRequest ?? nextRequest,
+          input: oauth ? chatGPTCodexResponsesEndpoint : request.input,
+          init: nextRequest,
+          oauth,
         }
       }
-      const routed = await route(requestInit)
-      const routedRequestInput = routed.input
-      const routedRequestInit = routed.init
-      if (!sessionID) {
-        return baseFetch(routedRequestInput, routedRequestInit)
+      const dispatch = async (routed: ReturnType<typeof route>) => {
+        if (routed.oauth) return openAIOAuth.request(routed.init, (nextRequest) => baseFetch(routed.input, nextRequest))
+        return baseFetch(routed.input, routed.init)
       }
+      const routed = route(requestInit)
+      if (!sessionID) return dispatch(routed)
 
       if (disposed || sessionGeneration(sessionID).deleted) return new Response(compactInvalidMessage, { status: 400 })
       if (shouldNativeCompact) {
         const unavailable = () => new Response("OpenAI native compact operation is no longer valid", { status: 400 })
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
-        const send = async (input: RequestInfo | URL, nextRequest: RequestInit) => {
+        const send = async (nextRouted: ReturnType<typeof route>) => {
           sessionGeneration(sessionID).activity++
           try {
-            nextRequest.signal?.throwIfAborted()
-            return await baseFetch(input, nextRequest)
+            const sendRequest = async (nextRequest: RequestInit) => {
+              nextRequest.signal?.throwIfAborted()
+              return baseFetch(nextRouted.input, nextRequest)
+            }
+            return nextRouted.oauth
+              ? await openAIOAuth.request(nextRouted.init, sendRequest)
+              : await sendRequest(nextRouted.init)
           } catch (error) {
             if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
             throw error
           }
         }
-        const response = await send(routedRequestInput, routedRequestInit)
+        const response = await send(routed)
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
-        routedRequestInit.signal?.throwIfAborted()
+        routed.init.signal?.throwIfAborted()
         if (response.ok) {
           if (matchingNativeCompaction) matchingNativeCompaction.completed = true
           return response
@@ -2241,9 +2251,9 @@ export function createCompactHooks(
           return response
         }
 
-        const retry = await route(originalRequestInit)
+        const retry = route(originalRequestInit)
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
-        const retriedResponse = await send(retry.input, retry.init)
+        const retriedResponse = await send(retry)
         if (!currentNativeCompaction(sessionID, matchingNativeCompaction)) return unavailable()
         retry.init.signal?.throwIfAborted()
         if (!retriedResponse.ok) return response
@@ -2251,7 +2261,7 @@ export function createCompactHooks(
         return retriedResponse
       }
       if (generation && currentSession(sessionID, generation)) rememberStableInstructions(providerID, sessionID, requestBody)
-      return baseFetch(routedRequestInput, routedRequestInit)
+      return dispatch(routed)
     }) as FetchLike
 
     Object.defineProperty(wrapped, wrappedFetch, { value: true })
@@ -2377,6 +2387,10 @@ export function createCompactHooks(
         stableInstructionsByProvider, pendingSystemByProvider]) map.clear()
       pendingNativeCompactions.clear()
       providerByMessage.clear()
+      if (oauthRuntimeRetained) {
+        oauthRuntimeRetained = false
+        releaseOpenAIOAuthRuntime()
+      }
       store.close()
     },
 

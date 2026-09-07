@@ -399,7 +399,7 @@ describe("immutable compaction retries", () => {
       headers.set("authorization", `Bearer ${openAIOAuthDummyKey}`)
       for (const access of ["old-token", "refreshed-token"]) {
         await f.hooks.auth?.loader?.(async () => ({
-          type: "oauth", access, refresh: "refresh-token", expires: Date.now() + 60_000, accountId: "account",
+          type: "oauth", access, refresh: "refresh-token", expires: Date.now() + 120_000, accountId: "account",
         }), {} as any)
         const response = await f.fetch(url, { ...f.init, headers })
         expect(response.status).toBe(access === "old-token" ? 429 : 200)
