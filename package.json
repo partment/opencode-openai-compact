@@ -56,6 +56,6 @@
     "@types/node": "26.6.1",
     "ajv": "8.20.0",
     "typescript": "7.0.2",
-    "vitest": "5.0.0"
+    "vitest": "5.0.1"
   }
 }
