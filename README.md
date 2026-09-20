@@ -3,6 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/opencode-openai-compact?style=flat-square)](https://www.npmjs.com/package/opencode-openai-compact)
 [![GitHub stars](https://img.shields.io/github/stars/partment/opencode-openai-compact?style=flat-square)](https://github.com/partment/opencode-openai-compact/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Plugin Security Scan](https://github.com/partment/opencode-openai-compact/actions/workflows/plugin-security.yml/badge.svg)](https://github.com/partment/opencode-openai-compact/actions/workflows/plugin-security.yml)
 
 Use OpenAI's official Responses API compaction v2 in OpenCode.
 

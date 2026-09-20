@@ -630,10 +630,7 @@ describe("OpenAI OAuth hooks", () => {
     }) as typeof fetch
     const tokenFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       tokenCalls.push({ url: String(requestInput), init })
-      return new Response(JSON.stringify({ access_token: "refreshed-access-token", expires_in: 3600 }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      })
+      throw new Error("token endpoint should not be called")
     }) as typeof fetch
 
     try {
@@ -745,7 +742,7 @@ describe("OpenAI OAuth hooks", () => {
       getAuth: async () => current,
       tokenFetch: (async () => {
         refreshes++
-        return Response.json({ access_token: "new", refresh_token: "refresh-new", expires_in: 3600 })
+        return Response.json({ access_token: "new", refresh_token: "rotated", expires_in: 3600 })
       }) as typeof fetch,
       async setAuth(auth) { current = auth },
     })
@@ -774,7 +771,7 @@ describe("OpenAI OAuth hooks", () => {
     const tokenFetch = (async () => {
       refreshes++
       await new Promise((resolve) => setTimeout(resolve, 5))
-      return Response.json({ access_token: "shared-new", refresh_token: "shared-rotated", expires_in: 3600 })
+      return Response.json({ access_token: "new", refresh_token: "rotated", expires_in: 3600 })
     }) as typeof fetch
     const make = () => createOpenAIOAuth({
       getAuth: async () => current,
@@ -783,8 +780,8 @@ describe("OpenAI OAuth hooks", () => {
     })
     const [first, second] = await Promise.all([make().requestInit({ headers: {} }), make().requestInit({ headers: {} })])
     expect(refreshes).toBe(1)
-    expect(new Headers(first.headers).get("authorization")).toBe("Bearer shared-new")
-    expect(new Headers(second.headers).get("authorization")).toBe("Bearer shared-new")
+    expect(new Headers(first.headers).get("authorization")).toBe("Bearer new")
+    expect(new Headers(second.headers).get("authorization")).toBe("Bearer new")
   })
 
   test("shares one token refresh across concurrent OpenAI OAuth responses", async () => {
@@ -798,7 +795,7 @@ describe("OpenAI OAuth hooks", () => {
     }) as typeof fetch
     const tokenFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       tokenCalls.push({ url: String(requestInput), init })
-      return new Response(JSON.stringify({ access_token: "refreshed-access-token", expires_in: 3600 }), {
+      return new Response(JSON.stringify({ access_token: "new", expires_in: 3600 }), {
         status: 200,
         headers: { "content-type": "application/json" },
       })
@@ -843,10 +840,10 @@ describe("OpenAI OAuth hooks", () => {
       expect(String(tokenCalls[0]?.init?.body)).toContain("refresh_token=refresh-token")
       expect(calls).toHaveLength(2)
       for (const call of calls) {
-        expect(new Headers(call.init?.headers).get("authorization")).toBe("Bearer refreshed-access-token")
+        expect(new Headers(call.init?.headers).get("authorization")).toBe("Bearer new")
       }
       expect(savedAuth).toHaveLength(1)
-      expect(savedAuth[0]?.access).toBe("refreshed-access-token")
+      expect(savedAuth[0]?.access).toBe("new")
     } finally {
       store.close()
     }

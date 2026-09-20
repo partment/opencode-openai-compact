@@ -388,7 +388,7 @@ describe("session compaction lifecycle", () => {
       const pending = f.send({ ...a.headers, authorization: `Bearer ${openAIOAuthDummyKey}` })
       await started.promise
       await f.event("session.deleted")
-      gate.resolve(Response.json({ access_token: "fresh-access", refresh_token: "fresh-refresh", expires_in: 3600 }))
+      gate.resolve(Response.json({ access_token: "new", refresh_token: "rotated", expires_in: 3600 }))
       expect((await pending).status).toBe(400)
       expect(f.network).not.toHaveBeenCalled()
       expect(f.store.count()).toBe(0)
