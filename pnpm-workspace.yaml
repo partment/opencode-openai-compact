@@ -1,4 +1,5 @@
 minimumReleaseAge: 1440
+minimumReleaseAgeStrict: false
 
 allowBuilds:
   msgpackr-extract: false
